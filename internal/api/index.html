@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DexSQL-Tree Playground</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #151a22;
+    --panel-2: #1b222c;
+    --line: #263041;
+    --text: #d7dee8;
+    --muted: #8b97a8;
+    --accent: #5cc8b0;
+    --accent-dim: #2b4d47;
+    --warn: #d9a441;
+    --err: #e06c75;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+    display: grid; grid-template-rows: 52px 1fr 26px; grid-template-columns: 300px 1fr;
+    grid-template-areas: "head head" "side main" "foot foot";
+  }
+  header {
+    grid-area: head; display: flex; align-items: center; gap: 16px; padding: 0 18px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: baseline; font-weight: 600; letter-spacing: .2px; }
+  .brand span { color: var(--accent); font-family: var(--mono); }
+  .conn { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+  input, select, button, textarea { font: inherit; color: var(--text); }
+  input[type=text], select, textarea {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; outline: none;
+  }
+  input[type=text]:focus, textarea:focus, select:focus { border-color: var(--accent-dim); }
+  button {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 14px; cursor: pointer; color: var(--text);
+  }
+  button.primary { background: var(--accent); color: #08120f; border-color: var(--accent); font-weight: 600; }
+  button:hover { border-color: var(--accent-dim); }
+  aside {
+    grid-area: side; background: var(--panel); border-right: 1px solid var(--line);
+    padding: 14px; overflow-y: auto; overflow-x: hidden; min-height: 0;
+    scrollbar-width: none;
+  }
+  aside::-webkit-scrollbar { width: 0; height: 0; display: none; }
+  aside #tables { flex: none; overflow: visible; align-content: flex-start; }
+  aside h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+  .tblist {
+    display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 16px;
+    padding-right: 6px;
+  }
+  .tblist button { padding: 4px 7px; font: 11.5px/1.2 var(--mono); border-radius: 4px; white-space: nowrap; }
+  .tblist button:hover { color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.7; }
+  main {
+    grid-area: main; display: flex; flex-direction: column; min-width: 0; padding: 14px 18px; gap: 10px; overflow: hidden;
+  }
+  .tabs { display: flex; gap: 4px; }
+  .tabs button { border-radius: 6px 6px 0 0; border-bottom: none; }
+  .tabs button.active { background: var(--panel); color: var(--accent); }
+  .editor { display: flex; flex-direction: column; gap: 8px; }
+  textarea {
+    width: 100%; min-height: 120px; resize: vertical; font: 13px/1.6 var(--mono);
+    background: var(--panel); border-radius: 8px; padding: 12px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row .spacer { flex: 1; }
+  .status { color: var(--muted); font: 12px var(--mono); }
+  .result { flex: 1; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; font: 12.5px var(--mono); }
+  thead th {
+    position: sticky; top: 0; background: var(--panel-2); text-align: left; padding: 8px 10px;
+    border-bottom: 1px solid var(--line); color: var(--muted); font-weight: 500; white-space: nowrap;
+  }
+  tbody td { padding: 6px 10px; border-bottom: 1px solid #1d242e; vertical-align: top; max-width: 520px; overflow: hidden; text-overflow: ellipsis; }
+  tbody tr:hover { background: #1a212b; }
+  td.null { color: #5b6675; font-style: italic; }
+  .empty { padding: 28px; color: var(--muted); text-align: center; }
+  .tree { padding: 14px 16px; font: 13px/1.9 var(--mono); white-space: pre; }
+  .tree .node { color: var(--text); }
+  .tree .depth { color: #3a4657; }
+  .tree .count { color: var(--warn); }
+  .tree .cycle { color: var(--err); }
+  .err { padding: 14px 16px; color: var(--err); font: 12.5px var(--mono); white-space: pre-wrap; }
+  footer {
+    grid-area: foot; display: flex; align-items: center; gap: 14px; padding: 0 18px;
+    background: var(--panel); border-top: 1px solid var(--line);
+    color: var(--muted); font: 11.5px var(--mono);
+  }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; max-width: 720px; }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog pre { font: 12.5px var(--mono); white-space: pre-wrap; color: var(--muted); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">dexsql<span>-tree</span></div>
+  <div class="conn">
+    <input id="path" type="text" placeholder="/path/to/app.apk" size="34">
+    <button class="primary" onclick="openDataset()">打开数据集</button>
+  </div>
+</header>
+
+<aside>
+  <h3>数据集</h3>
+  <div id="datasets" class="hint">尚未加载。输入 APK 或 DEX 路径。</div>
+  <h3 style="margin-top:18px">表</h3>
+  <div class="tblist" id="tables"></div>
+  <h3>示例</h3>
+  <div class="hint">
+    SELECT descriptor FROM methods<br>WHERE name = 'main'
+  </div>
+</aside>
+
+<main>
+  <div class="tabs">
+    <button id="tab-sql" class="active" onclick="setTab('sql')">SQL 查询</button>
+    <button id="tab-tree" onclick="setTab('tree')">调用树</button>
+  </div>
+
+  <section id="pane-sql" class="editor">
+    <textarea id="sql" spellcheck="false">SELECT descriptor, param_count
+FROM methods
+WHERE class_descriptor = 'Ldemo/Hello;'
+LIMIT 50;</textarea>
+    <div class="row">
+      <button class="primary" onclick="runQuery()">执行</button>
+      <span class="status" id="qstatus"></span>
+      <span class="spacer"></span>
+      <span class="status">只读，最多 1000 行</span>
+    </div>
+  </section>
+
+  <section id="pane-tree" class="editor hidden">
+    <input id="method" type="text" placeholder="Ldemo/Hello;->main([Ljava/lang/String;)V">
+    <div class="row">
+      <select id="direction">
+        <option value="callers">调用者 callers</option>
+        <option value="callees">被调用 callees</option>
+      </select>
+      <select id="depth">
+        <option value="1">深度 1</option>
+        <option value="2">深度 2</option>
+        <option value="3" selected>深度 3</option>
+        <option value="5">深度 5</option>
+      </select>
+      <button class="primary" onclick="runTree()">构建</button>
+      <span class="status" id="tstatus"></span>
+    </div>
+  </section>
+
+  <div class="result" id="result"><div class="empty">加载数据集后执行查询或构建调用树。</div></div>
+</main>
+
+<footer>
+  <span id="foot">dexsql-tree</span>
+  <span id="warnings"></span>
+</footer>
+
+<dialog id="tabledlg">
+  <h3 id="dlgtitle" style="margin-top:0"></h3>
+  <pre id="dlgbody"></pre>
+  <div class="row"><span class="spacer"></span><button onclick="document.getElementById('tabledlg').close()">关闭</button></div>
+</dialog>
+
+<script>
+let dataset = null;
+let tables = [];
+let tab = "sql";
+
+async function jget(url) {
+  const r = await fetch(url);
+  return r.json();
+}
+async function jpost(url, body) {
+  const r = await fetch(url, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
+  return r.json();
+}
+
+function fmtCell(v) {
+  if (v === null || v === undefined) return '<td class="null">NULL</td>';
+  const s = String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  return `<td title="${s.replace(/"/g, "&quot;")}">${s}</td>`;
+}
+
+function showError(e) {
+  document.getElementById("result").innerHTML = `<div class="err">${String(e).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</div>`;
+}
+
+async function refreshDatasets() {
+  const data = await jget("/api/datasets");
+  const box = document.getElementById("datasets");
+  if (!data.datasets || !data.datasets.length) {
+    box.textContent = "尚未加载。输入 APK 或 DEX 路径。";
+    return;
+  }
+  dataset = dataset || data.datasets[0].id;
+  box.innerHTML = data.datasets.map(d => {
+    const active = d.id === dataset ? ' style="color:var(--accent)"' : '';
+    const s = d.stats;
+    return `<div${active}><b>${d.id}</b> ${d.path.split("/").pop()}<br>
+      ${s.classes} 类 / ${s.methods} 方法 / ${s.strings} 字符串</div>`;
+  }).join("<hr style='border:0;border-top:1px solid var(--line)'>");
+  const warnings = data.datasets.flatMap(d => d.warnings || []);
+  document.getElementById("warnings").textContent = warnings.length ? `${warnings.length} 条解析警告` : "";
+  document.getElementById("foot").textContent = `dexsql-tree · ${data.datasets.length} 个数据集`;
+}
+
+async function openDataset() {
+  const path = document.getElementById("path").value.trim();
+  if (!path) return;
+  document.getElementById("qstatus").textContent = "加载中...";
+  const d = await jpost("/api/datasets", {path});
+  if (d.error) { showError(d.error); document.getElementById("qstatus").textContent = ""; return; }
+  dataset = d.id;
+  document.getElementById("qstatus").textContent = `已加载 ${d.stats.classes} 类 / ${d.stats.methods} 方法`;
+  await refreshDatasets();
+}
+
+async function loadTables() {
+  const data = await jget("/api/tables");
+  tables = data.tables;
+  const box = document.getElementById("tables");
+  box.innerHTML = tables.map(t => `<button onclick="describe('${t.name}')">${t.name}</button>`).join("");
+}
+
+async function describe(name) {
+  const t = tables.find(x => x.name === name);
+  document.getElementById("dlgtitle").textContent = name;
+  document.getElementById("dlgbody").textContent = (t.doc || "") + "\n\n" + t.cols.map(c => "  " + c).join("\n");
+  document.getElementById("tabledlg").showModal();
+}
+
+async function runQuery() {
+  if (!dataset) { showError("请先加载数据集"); return; }
+  const sql = document.getElementById("sql").value.trim();
+  document.getElementById("qstatus").textContent = "执行中...";
+  const t0 = performance.now();
+  const res = await jpost("/api/query", {dataset, sql, limit: 1000});
+  if (res.error) {
+    document.getElementById("qstatus").textContent = "失败";
+    showError(res.error);
+    return;
+  }
+  const ms = Math.round(performance.now() - t0);
+  document.getElementById("qstatus").textContent = `${res.rowCount} 行 · ${res.elapsedMs} ms${res.truncated ? " · 已截断" : ""}`;
+  if (!res.rows.length) {
+    document.getElementById("result").innerHTML = `<div class="empty">0 行 · ${ms} ms</div>`;
+    return;
+  }
+  const head = res.columns.map(c => `<th>${c}</th>`).join("");
+  const body = res.rows.map(r => `<tr>${r.map(fmtCell).join("")}</tr>`).join("");
+  document.getElementById("result").innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function treeText(n, prefix, isLast, root) {
+  let out = "";
+  let nextPrefix = prefix;
+  if (root) {
+    out += `<span class="node">${n.descriptor}</span>\n`;
+  } else {
+    const branch = isLast ? "└─ " : "├─ ";
+    out += `<span class="depth">${prefix}${branch}</span><span class="node">${n.descriptor}</span>`;
+    if (n.calls > 1) out += ` <span class="count">x${n.calls}</span>`;
+    if (n.cycle) out += ` <span class="cycle">cycle</span>`;
+    out += "\n";
+    nextPrefix = prefix + (isLast ? "   " : "│  ");
+  }
+  if (n.children) {
+    n.children.forEach((c, i) => { out += treeText(c, nextPrefix, i === n.children.length - 1, false); });
+  }
+  return out;
+}
+
+async function runTree() {
+  if (!dataset) { showError("请先加载数据集"); return; }
+  const method = document.getElementById("method").value.trim();
+  if (!method) { showError("请输入方法描述符"); return; }
+  document.getElementById("tstatus").textContent = "构建中...";
+  const res = await jpost("/api/tree", {
+    dataset, method,
+    direction: document.getElementById("direction").value,
+    depth: Number(document.getElementById("depth").value),
+    maxNodes: 4000
+  });
+  if (res.error) { document.getElementById("tstatus").textContent = "失败"; showError(res.error); return; }
+  document.getElementById("tstatus").textContent = `${res.nodeCount} 节点 · ${res.edgeCount} 边`;
+  document.getElementById("result").innerHTML = `<div class="tree">${treeText(res.root, "", true, true)}</div>`;
+}
+
+function setTab(t) {
+  tab = t;
+  document.getElementById("tab-sql").classList.toggle("active", t === "sql");
+  document.getElementById("tab-tree").classList.toggle("active", t === "tree");
+  document.getElementById("pane-sql").classList.toggle("hidden", t !== "sql");
+  document.getElementById("pane-tree").classList.toggle("hidden", t !== "tree");
+}
+
+document.getElementById("sql").addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runQuery(); }
+});
+document.getElementById("path").addEventListener("keydown", e => {
+  if (e.key === "Enter") openDataset();
+});
+
+(async function init() {
+  await refreshDatasets();
+  await loadTables();
+  const params = new URLSearchParams(location.search);
+  const q = params.get("sql");
+  if (q) {
+    document.getElementById("sql").value = q;
+    await runQuery();
+  }
+  const m = params.get("method");
+  if (m) {
+    setTab("tree");
+    document.getElementById("method").value = m;
+    if (params.get("direction")) document.getElementById("direction").value = params.get("direction");
+    if (params.get("depth")) document.getElementById("depth").value = params.get("depth");
+    await runTree();
+  }
+})();
+</script>
+</body>
+</html>

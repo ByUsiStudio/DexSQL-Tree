@@ -1,0 +1,8 @@
+bin/
+java/target/
+java/*/target/
+*.iml
+.idea/
+.vscode/
+*.log
+.DS_Store

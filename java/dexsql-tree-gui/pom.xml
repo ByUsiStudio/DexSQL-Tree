@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.dexsqltree</groupId>
+    <artifactId>dexsql-tree-java</artifactId>
+    <version>0.1.0</version>
+  </parent>
+
+  <artifactId>dexsql-tree-gui</artifactId>
+  <name>dexsql-tree JavaFX UI</name>
+
+  <properties>
+    <dexsql.args></dexsql.args>
+    <dexsql.tree.bin></dexsql.tree.bin>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.dexsqltree</groupId>
+      <artifactId>dexsql-tree-client</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.openjfx</groupId>
+      <artifactId>javafx-controls</artifactId>
+      <version>${javafx.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.openjfx</groupId>
+        <artifactId>javafx-maven-plugin</artifactId>
+        <version>0.0.8</version>
+        <configuration>
+          <mainClass>org.dexsqltree.gui.DexsqlTreeApp</mainClass>
+          <commandlineArgs>${dexsql.args}</commandlineArgs>
+          <options>
+            <option>-Ddexsql.tree.bin=${dexsql.tree.bin}</option>
+          </options>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <mainClass>org.dexsqltree.gui.DexsqlTreeApp</mainClass>
+            </manifest>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
