@@ -20,6 +20,7 @@ import (
 	"syscall"
 
 	"github.com/byusi-studio/dexsql-tree/internal/api"
+	"github.com/byusi-studio/dexsql-tree/internal/cache"
 	"github.com/byusi-studio/dexsql-tree/internal/dex"
 	"github.com/byusi-studio/dexsql-tree/internal/i18n"
 	"github.com/byusi-studio/dexsql-tree/internal/mcp"
@@ -28,8 +29,12 @@ import (
 )
 
 type multiFlag struct {
-	paths []string
-	debug bool
+	paths    []string
+	debug    bool
+	jobs     int
+	profile  string
+	cache    bool
+	cacheDir string
 }
 
 func (m *multiFlag) String() string { return strings.Join(m.paths, ",") }
@@ -105,6 +110,8 @@ func main() {
 		err = cmdServe(rest)
 	case "mcp":
 		err = cmdMCP(rest)
+	case "cache":
+		err = cmdCache(rest)
 	case "lang", "language", "i18n":
 		err = cmdLang(rest)
 	case "version", "--version", "-v":
@@ -136,6 +143,7 @@ Usage:
   dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
   dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765]
   dexsql-tree mcp     [--input app.apk]
+  dexsql-tree cache   list|clear|path|info      manage the persisted catalog cache
   dexsql-tree lang    set zh --write            enable Chinese prompts permanently
 
 Language:
@@ -143,6 +151,11 @@ Language:
   --lang zh|en               overrides the environment for one invocation.
 
 Options:
+  --cache  reuse the catalog built for this input (reopening drops from
+           seconds to milliseconds; keyed by path, size, mtime and settings)
+  --profile fast|full
+           fast (default) skips the annotation tables; full materialises all
+  --jobs N decode N DEX files in parallel (default: one per CPU)
   --debug  materialise DEX line-number tables (off by default: debug programs
            can be larger than the code itself)
   --disk   keep the catalog in a temporary file to reduce memory
@@ -162,6 +175,7 @@ const usageZH = `dexsql-tree —— Android APK/DEX 的 SQL 查询与调用树�
   dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
   dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765]
   dexsql-tree mcp     [--input app.apk]
+  dexsql-tree cache   list|clear|path|info      管理磁盘目录缓存
   dexsql-tree lang    set zh --write            永久开启中文提示
 
 语言:
@@ -169,10 +183,24 @@ const usageZH = `dexsql-tree —— Android APK/DEX 的 SQL 查询与调用树�
   --lang zh|en              只对本次调用生效。
 
 可选:
+  --cache  复用该输入已生成的目录（再次打开从数秒降到毫秒级；
+           键由路径、大小、修改时间与设置共同决定）
+  --profile fast|full
+           fast（默认）跳过注解表，full 物化全部内容
+  --jobs N 并行解析 N 个 DEX（默认等于 CPU 核数）
   --debug  物化 DEX 行号表（默认关闭：调试信息可能比代码本身还大）
   --disk   将目录放在临时文件中，降低内存占用
 重复 --input 可同时查询多个 APK/DEX 文件。
 `
+
+// tracef writes a diagnostic line to stderr when DEXSQL_TREE_VERBOSE is set.
+// stdout stays machine-readable, so this never corrupts JSON output.
+func tracef(format string, args ...any) {
+	if os.Getenv("DEXSQL_TREE_VERBOSE") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
 
 func usage() {
 	if i18n.On() {
@@ -188,7 +216,7 @@ func (m multiFlag) load() (*dex.Container, error) {
 	}
 	var cs []*dex.Container
 	for _, p := range m.paths {
-		c, err := dex.Load(p, dex.Options{Debug: m.debug})
+		c, err := dex.Load(p, dex.Options{Debug: m.debug, Jobs: m.jobs})
 		if err != nil {
 			return nil, err
 		}
@@ -205,6 +233,37 @@ func addInputFlags(fs *flag.FlagSet, inputs *multiFlag) {
 	fs.BoolVar(&inputs.debug, "debug", false, i18n.T(
 		"materialise DEX line-number tables (large and slow)",
 		"物化 DEX 行号表（体积大、速度慢）"))
+	fs.IntVar(&inputs.jobs, "jobs", 0, i18n.T(
+		"parallel DEX decoders (default: CPU count)",
+		"并行解析的 DEX 数量（默认等于 CPU 核数）"))
+	fs.StringVar(&inputs.profile, "profile", "fast", i18n.T(
+		"fast skips annotation tables, full materialises everything",
+		"fast 跳过注解表，full 物化全部内容"))
+	fs.BoolVar(&inputs.cache, "cache", false, i18n.T(
+		"reuse the on-disk catalog for this input",
+		"复用该输入已生成的磁盘目录"))
+	fs.StringVar(&inputs.cacheDir, "cache-dir", "", i18n.T(
+		"cache directory (default: user cache dir)",
+		"缓存目录（默认使用系统缓存目录）"))
+}
+
+// storeOptions turns the parsed flags into a materialisation request, wiring up
+// the persistent cache when --cache is set.
+func (m *multiFlag) storeOptions(disk bool) (store.Options, error) {
+	profile, err := store.ParseProfile(m.profile)
+	if err != nil {
+		return store.Options{}, err
+	}
+	opt := store.Options{Disk: disk, Profile: profile}
+	if m.cache {
+		dir := m.cacheDir
+		if dir == "" {
+			dir = cache.Dir()
+		}
+		opt.CacheDir = dir
+		opt.CacheKey = cache.Key(m.paths, string(profile), api.Version, m.debug)
+	}
+	return opt, nil
 }
 
 func cmdQuery(args []string) error {
@@ -243,11 +302,18 @@ func cmdQuery(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(c, store.Options{Disk: *disk})
+	opt, err := inputs.storeOptions(*disk)
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(c, opt)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if opt.CacheDir != "" {
+		tracef("catalog: %s (profile %s, %d methods)", map[bool]string{true: "cache hit", false: "materialised"}[st.Cached], st.Profile, st.Stats.Methods)
+	}
 
 	run := func(q string) error {
 		res, err := st.Query(q, *limit)
@@ -825,6 +891,15 @@ func cmdServe(args []string) error {
 	s := api.New()
 	s.Debug = inputs.debug
 	s.Disk = *disk
+	profile, err := store.ParseProfile(inputs.profile)
+	if err != nil {
+		return err
+	}
+	s.Profile = profile
+	s.Cache = inputs.cache
+	if inputs.cacheDir != "" {
+		s.CacheDir = inputs.cacheDir
+	}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -837,7 +912,11 @@ func cmdServe(args []string) error {
 		if err != nil {
 			return err
 		}
-		st, err := store.Open(c, store.Options{Disk: *disk})
+		opt, err := inputs.storeOptions(*disk)
+		if err != nil {
+			return err
+		}
+		st, err := store.Open(c, opt)
 		if err != nil {
 			return err
 		}
@@ -858,6 +937,14 @@ func cmdMCP(args []string) error {
 	srv := mcp.New(os.Stdout)
 	srv.Debug = inputs.debug
 	srv.Disk = *disk
+	profile, err := store.ParseProfile(inputs.profile)
+	if err != nil {
+		return err
+	}
+	srv.Profile = profile
+	srv.Cache = inputs.cache
+	srv.CacheDir = inputs.cacheDir
+	srv.Version = api.Version
 	defer srv.Close()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -1163,4 +1250,81 @@ func stripBlock(text string) string {
 		res = strings.ReplaceAll(res, "\n\n\n", "\n\n")
 	}
 	return res
+}
+
+// ---------------------------------------------------------------- cache
+
+// cmdCache manages the persistent catalog cache: list, clear, path, info.
+func cmdCache(args []string) error {
+	action := "list"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		action, args = args[0], args[1:]
+	}
+	fs := flag.NewFlagSet("cache", flag.ContinueOnError)
+	dirFlag := fs.String("dir", "", i18n.T("cache directory", "缓存目录"))
+	var inputs multiFlag
+	addInputFlags(fs, &inputs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := *dirFlag
+	if dir == "" {
+		dir = cache.Dir()
+	}
+	switch action {
+	case "list", "ls":
+		ents, err := cache.List(dir)
+		if err != nil {
+			return err
+		}
+		if len(ents) == 0 {
+			fmt.Printf(i18n.T("cache is empty: %s\n", "缓存为空: %s\n"), dir)
+			return nil
+		}
+		var total int64
+		w := 0
+		for _, e := range ents {
+			total += e.Size
+			if n := len(e.Key); n > w {
+				w = n
+			}
+		}
+		fmt.Printf("%-*s  %10s  %s\n", w, i18n.T("key", "键"), i18n.T("size", "大小"), i18n.T("modified", "修改时间"))
+		for _, e := range ents {
+			fmt.Printf("%-*s  %10s  %s\n", w, e.Key, humanBytes(e.Size), e.ModTime.Format("2006-01-02 15:04"))
+		}
+		fmt.Printf(i18n.T("\n%d catalogs, %s total, in %s\n", "\n共 %d 个目录，合计 %s，位置 %s\n"),
+			len(ents), humanBytes(total), dir)
+	case "clear", "clean", "rm":
+		n, b, err := cache.Clear(dir)
+		if err != nil {
+			return err
+		}
+		fmt.Printf(i18n.T("removed %d catalogs (%s) from %s\n", "已删除 %d 个目录（%s），位置 %s\n"), n, humanBytes(b), dir)
+	case "path", "dir":
+		fmt.Println(dir)
+	case "info":
+		if len(inputs.paths) == 0 {
+			return fmt.Errorf(i18n.T("cache info needs --input", "cache info 需要 --input 参数"))
+		}
+		profile, err := store.ParseProfile(inputs.profile)
+		if err != nil {
+			return err
+		}
+		key := cache.Key(inputs.paths, string(profile), api.Version, inputs.debug)
+		e, ok := cache.Stat(dir, key)
+		if !ok {
+			fmt.Printf(i18n.T("no catalog for this input (key %s); run a query with --cache to build it\n",
+				"该输入还没有目录（键 %s）；带 --cache 运行一次查询即可生成\n"), key)
+			return nil
+		}
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("key:", "键:"), 12), e.Key)
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("path:", "路径:"), 12), e.Path)
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("size:", "大小:"), 12), humanBytes(e.Size))
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("built:", "生成于:"), 12), e.ModTime.Format("2006-01-02 15:04:05"))
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("profile:", "档位:"), 12), profile)
+	default:
+		return fmt.Errorf(i18n.T("unknown cache action %q (list|clear|path|info)", "未知的 cache 操作 %q（list|clear|path|info）"), action)
+	}
+	return nil
 }

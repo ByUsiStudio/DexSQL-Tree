@@ -16,8 +16,8 @@ mvn install     # 安装到本地仓库，后续 javafx:run 才能解析 client 
 
 产物：
 
-- `dexsql-tree-client/target/dexsql-tree-client-0.2.0.jar`
-- `dexsql-tree-gui/target/dexsql-tree-gui-0.2.0.jar`
+- `dexsql-tree-client/target/dexsql-tree-client-0.3.0.jar`
+- `dexsql-tree-gui/target/dexsql-tree-gui-0.3.0.jar`
 
 ## 2. 用现成引擎
 
@@ -44,6 +44,34 @@ long elapsedMs
 ```
 
 `cell(row, col)` 是便捷方法，越界返回 null。
+
+## 2.1 并发与异步
+
+客户端本身无共享可变状态（`useDataset` 只是给省略 `dataset` 的调用提供默认值），并内置一个 2–8 线程的 daemon 池：
+
+```java
+// 三个请求同时飞，互不阻塞
+CompletableFuture<QueryResult> a = client.queryAsync(sql1, 500, "d1");
+CompletableFuture<QueryResult> b = client.queryAsync(sql2, 500, "d1");
+CompletableFuture<CallTree> c = client.treeAsync(desc, Direction.CALLERS, 3, "d1");
+
+CompletableFuture.allOf(a, b, c).join();
+```
+
+- `DexsqlClient.executor()` 是同一个池，GUI 的 `Task` 也跑在上面，线程数见 `poolSize()`。
+- 取消用 `future.cancel(true)` 或 `Task.cancel(true)`：中断会打断阻塞中的 HTTP 请求，客户端抛 `DexsqlException("cancelled")`。
+- 需要确定性顺序时传显式 `dataset`，不要依赖 `useDataset`。
+
+## 2.2 搜索、模板与缓存
+
+```java
+QueryResult hits = client.search("oauth", List.of("class", "method"), 50, "d1");
+QueryResult callers = client.recipe("callers", Map.of("method", desc), 200, "d1");
+
+Health h = client.healthInfo();        // version / lang / profile / cache
+CacheInfo cache = client.cache();      // dir / count / bytes / entries
+client.clearCache();
+```
 
 ## 3. 让 Java 管理引擎
 

@@ -336,6 +336,7 @@ type File struct {
 	AnnotationSets     []*AnnotationSet
 	AnnotationRefLists []*AnnotationRefList
 	EncodedArrays      []*EncodedArray
+	HiddenApiFlags     []HiddenApiFlag
 	Warnings           []string
 }
 

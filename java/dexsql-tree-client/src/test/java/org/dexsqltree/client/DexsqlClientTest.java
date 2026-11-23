@@ -11,6 +11,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -50,6 +51,25 @@ class DexsqlClientTest {
                         + "\"direction\":\"callees\",\"maxDepth\":2,\"nodeCount\":2,\"edgeCount\":1,"
                         + "\"truncated\":false}"));
         server.createContext("/api/smali", ex -> respond(ex, 200, "{\"smali\":\".method La;->b()V\\n.end method\"}"));
+        server.createContext("/api/search", ex -> {
+            String q = ex.getRequestURI().getQuery();
+            if (q == null || q.contains("keyword=&") || q.endsWith("keyword=")) {
+                respond(ex, 400, "{\"error\":\"keyword is required\"}");
+                return;
+            }
+            respond(ex, 200, "{\"columns\":[\"kind\",\"name\",\"owner\",\"detail\"],"
+                    + "\"rows\":[[\"method\",\"La;->b()V\",\"La;\",\"direct\"]],"
+                    + "\"rowCount\":1,\"truncated\":false,\"elapsedMs\":1,\"echo\":\"" + q + "\"}");
+        });
+        server.createContext("/api/cache", ex -> {
+            if ("DELETE".equals(ex.getRequestMethod())) {
+                respond(ex, 200, "{\"removed\":2,\"bytes\":4096}");
+            } else {
+                respond(ex, 200, "{\"dir\":\"/tmp/cache\",\"enabled\":true,\"count\":2,\"bytes\":8192,"
+                        + "\"entries\":[{\"key\":\"aaa\",\"path\":\"/tmp/cache/aaa.db\",\"size\":4096,"
+                        + "\"modTime\":\"2026-01-01T00:00:00Z\"}]}");
+            }
+        });
         server.start();
         client = new DexsqlClient("http://127.0.0.1:" + server.getAddress().getPort());
     }
@@ -109,5 +129,47 @@ class DexsqlClientTest {
         assertEquals(1, client.tables().size());
         assertEquals("methods", client.tables().get(0).name());
         assertTrue(client.smali("La;->b()V").contains(".method"));
+    }
+
+    @Test
+    void healthCarriesEngineSettings() {
+        Health h = client.healthInfo();
+        assertTrue(h.ok());
+        assertEquals("0.1.0", h.version());
+    }
+
+    @Test
+    void searchSendsKindsAndDecodesRows() {
+        QueryResult r = client.search("b()V", List.of("method", "class"), 5, "d1");
+        assertEquals(1, r.rowCount());
+        assertEquals("method", r.cell(0, 0));
+        assertEquals("La;->b()V", r.cell(0, 1));
+    }
+
+    @Test
+    void searchWithoutKeywordIsRejected() {
+        DexsqlException e = assertThrows(DexsqlException.class,
+                () -> client.search("", List.of("method"), 5, null));
+        assertEquals(400, e.status());
+    }
+
+    @Test
+    void cacheReportsAndClears() {
+        CacheInfo info = client.cache();
+        assertTrue(info.enabled());
+        assertEquals(2, info.count());
+        assertEquals(1, info.entries().size());
+        assertEquals("aaa", info.entries().get(0).key());
+
+        CacheInfo after = client.clearCache();
+        assertEquals(2, after.count());
+    }
+
+    @Test
+    void asyncQueryUsesTheSharedPool() throws Exception {
+        assertTrue(DexsqlClient.poolSize() >= 2);
+        QueryResult r = client.queryAsync("SELECT 1", 10, "d1").get(10, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals(2, r.rowCount());
+        assertEquals("Hello", r.cell(0, 0));
     }
 }

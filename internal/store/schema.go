@@ -189,6 +189,9 @@ var Catalog = []Table{
 		"value_index UInt32?", "value_i64 Int64?", "value_f64 Float64?"}},
 	{Name: "method_handles", Doc: "DEX 038+ method_handle_item rows.", Cols: []string{
 		"file_id UInt32", "method_handle_idx UInt32", "method_handle_type UInt32", "member_idx UInt32"}},
+	{Name: "hiddenapi_flags", Doc: "Hidden API restriction per field/method (map_list type 0xF000); empty rows are omitted.", Cols: []string{
+		"file_id UInt32", "class_idx UInt32", "class_descriptor Utf8", "member_kind Utf8",
+		"member_idx UInt32", "flags UInt32", "restriction Utf8"}},
 }
 
 // CatalogByName indexes Catalog.

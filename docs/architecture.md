@@ -13,7 +13,7 @@
   │                                        → 注解目录 / encoded_value
   │                                        → debug_info 状态机
   │
-  ├─ store.Open                           建 55 张表 → 单事务批量插入 → 建索引 → 建 3 个视图 → query_only=ON
+  ├─ store.Open                           建 56 张表 → 单事务批量插入 → 建索引 → 建 3 个视图 → query_only=ON
   │
   ├─ tree.BuildGraph                      按方法描述符聚合调用边（含调用点计数）
   │

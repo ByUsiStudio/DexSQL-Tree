@@ -7,8 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Container is one input file (APK, JAR, ZIP or bare DEX) after loading.
@@ -31,16 +33,38 @@ func Load(path string, opts ...Options) (*Container, error) {
 }
 
 // ParseContainer decodes an in-memory DEX or ZIP image.
+//
+// Multi-dex archives are decoded concurrently: every DEX is an independent
+// image, so the only shared state is the result slice, which is filled by
+// index. Ordering is therefore identical to the serial version.
 func ParseContainer(data []byte, path string, opts ...Options) (*Container, error) {
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	c := &Container{Path: path}
 	if bytes.HasPrefix(data, []byte("dex\n")) {
-		f, err := Parse(data, path, filepath.Base(path), 0, opts...)
-		if err != nil {
-			return nil, err
+		images := splitDexContainer(data)
+		for i, img := range images {
+			name := filepath.Base(path)
+			if len(images) > 1 {
+				name = fmt.Sprintf("%s#%d", name, i+1)
+			}
+			f, err := Parse(img, path, name, uint32(i), opt)
+			if err != nil {
+				if len(images) == 1 {
+					return nil, err
+				}
+				c.Warnings = append(c.Warnings, fmt.Sprintf("%s: %v", name, err))
+				continue
+			}
+			c.Files = append(c.Files, f)
+			c.DexBytes += int64(len(img))
+			c.EntryName = append(c.EntryName, name)
 		}
-		c.Files = []*File{f}
-		c.DexBytes = int64(len(data))
-		c.EntryName = []string{filepath.Base(path)}
+		if len(c.Files) == 0 {
+			return nil, fmt.Errorf("%s: no readable dex image", path)
+		}
 		return c, nil
 	}
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
@@ -57,31 +81,116 @@ func ParseContainer(data []byte, path string, opts ...Options) (*Container, erro
 	sort.Slice(entries, func(i, j int) bool {
 		return dexOrder(entries[i].Name) < dexOrder(entries[j].Name)
 	})
-	for _, e := range entries {
-		rc, err := e.Open()
-		if err != nil {
-			c.Warnings = append(c.Warnings, fmt.Sprintf("%s: %v", e.Name, err))
+
+	type result struct {
+		files  []*File
+		bytes  int
+		name   string
+		failed error
+	}
+	results := make([]result, len(entries))
+	jobs := opt.Jobs
+	if jobs <= 0 {
+		jobs = runtime.NumCPU()
+	}
+	if jobs > len(entries) {
+		jobs = len(entries)
+	}
+	if jobs < 1 {
+		jobs = 1
+	}
+	sem := make(chan struct{}, jobs)
+	var wg sync.WaitGroup
+	for i, e := range entries {
+		wg.Add(1)
+		go func(i int, e *zip.File) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res := result{name: e.Name}
+			rc, err := e.Open()
+			if err != nil {
+				res.failed = err
+				results[i] = res
+				return
+			}
+			buf, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				res.failed = err
+				results[i] = res
+				return
+			}
+			res.bytes = len(buf)
+			images := splitDexContainer(buf)
+			for j, img := range images {
+				name := e.Name
+				if len(images) > 1 {
+					name = fmt.Sprintf("%s#%d", e.Name, j+1)
+				}
+				f, err := Parse(img, path, name, 0, opt)
+				if err != nil {
+					if len(images) == 1 {
+						res.failed = err
+					}
+					break
+				}
+				res.files = append(res.files, f)
+				res.name = name
+			}
+			results[i] = res
+		}(i, e)
+	}
+	wg.Wait()
+
+	for _, res := range results {
+		if res.failed != nil {
+			c.Warnings = append(c.Warnings, fmt.Sprintf("%s: %v", res.name, res.failed))
 			continue
 		}
-		buf, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			c.Warnings = append(c.Warnings, fmt.Sprintf("%s: %v", e.Name, err))
-			continue
+		for _, f := range res.files {
+			f.FileID = uint32(len(c.Files))
+			c.Files = append(c.Files, f)
+			c.DexBytes += int64(f.ByteLen)
+			c.EntryName = append(c.EntryName, f.EntryName)
 		}
-		f, err := Parse(buf, path, e.Name, uint32(len(c.Files)), opts...)
-		if err != nil {
-			c.Warnings = append(c.Warnings, fmt.Sprintf("%s: %v", e.Name, err))
-			continue
-		}
-		c.Files = append(c.Files, f)
-		c.DexBytes += int64(len(buf))
-		c.EntryName = append(c.EntryName, e.Name)
 	}
 	if len(c.Files) == 0 {
 		return nil, fmt.Errorf("%s: no readable dex entry", path)
 	}
 	return c, nil
+}
+
+// splitDexContainer expands a DEX 041 container into its logical images.
+// Earlier versions return the single image unchanged. In a 041 container the
+// link_size/link_off header fields are reused as container_size/header_offset,
+// and the logical images follow each other, each starting with its own header.
+func splitDexContainer(data []byte) [][]byte {
+	single := [][]byte{data}
+	if len(data) < 112 || string(data[4:7]) != "041" {
+		return single
+	}
+	containerSize := leUint32(data[0x2c:]) // header field 11: link_size
+	headerOff := leUint32(data[0x30:])     // header field 12: link_off
+	// header_offset is relative to the container start, so the first header
+	// legitimately sits at 0.
+	if containerSize <= 1 || int(headerOff)+112 > len(data) {
+		return single
+	}
+	var out [][]byte
+	pos := int(headerOff)
+	for i := uint32(0); i < containerSize && pos+112 <= len(data); i++ {
+		size := int(leUint32(data[pos+0x20:])) // file_size
+		if size < 112 || pos+size > len(data) {
+			break
+		}
+		out = append(out, data[pos:pos+size])
+		pos += size
+	}
+	if len(out) <= 1 {
+		return single
+	}
+	return out
 }
 
 // dexOrder sorts classes.dex first, then classesN.dex by N, then other names.

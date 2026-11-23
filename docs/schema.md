@@ -66,6 +66,7 @@
 | `call_sites` | 7 | DEX 038+ call_site_id_item summaries. |
 | `call_site_args` | 8 | Top-level encoded values of a call site. |
 | `method_handles` | 4 | DEX 038+ method_handle_item rows. |
+| `hiddenapi_flags` | 7 | Hidden API restriction per field/method (map_list type 0xF000). |
 
 ### 便捷视图
 
@@ -887,3 +888,32 @@ DEX 038+ method_handle_item rows.
 | `method_handle_idx` | UInt32 |
 | `method_handle_type` | UInt32 |
 | `member_idx` | UInt32 |
+
+### `hiddenapi_flags`
+
+Android 10+ 把 `hiddenapi_class_data_item` 写进 DEX，用位掩码标注每个字段/方法能否从应用代码调用。这是判断"能不能用这个隐藏 API"的唯一权威来源，比猜测 `@hide` 可靠。
+
+| 列 | 类型 | 说明 |
+| --- | --- | --- |
+| `file_id` | UInt32 | 所属 DEX |
+| `class_idx` | UInt32 | class_defs 下标 |
+| `class_descriptor` | Utf8 | 便于直接阅读的类描述符 |
+| `member_kind` | Utf8 | `field` 或 `method` |
+| `member_idx` | UInt32 | field_idx 或 method_idx |
+| `flags` | UInt32 | 原始位掩码 |
+| `restriction` | Utf8 | `sdk` / `unsupported` / `blocked` / `core-platform` / `test` |
+
+只写入 `flags != 0` 的成员，所以没有限制的成员不会出现在表里。`restriction` 取最严格的位，规则与 Android 工具链一致。
+
+```sql
+-- 这个类里哪些方法被封锁
+SELECT m.descriptor, h.restriction
+FROM hiddenapi_flags h
+JOIN methods m ON m.file_id = h.file_id AND m.method_idx = h.member_idx
+WHERE h.member_kind = 'method' AND h.class_descriptor = 'Landroid/os/SystemProperties;';
+
+-- 各限制级别的数量
+SELECT restriction, count(*) FROM hiddenapi_flags GROUP BY restriction ORDER BY 2 DESC;
+```
+
+表为空有两种可能：包是 debuggable 构建（没有该节），或者所有成员都是 SDK 公开。`SELECT count(*) FROM map_items WHERE type_code = 61440` 可以区分——有 0xF000 却没有行，说明确实没有受限成员。

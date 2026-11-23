@@ -17,6 +17,9 @@ type Options struct {
 	// programs are often several times larger than the code itself, so this is
 	// off by default.
 	Debug bool
+	// Jobs caps how many DEX images are decoded at once inside a multi-dex
+	// archive. Zero means one per CPU.
+	Jobs int
 }
 
 func Parse(data []byte, sourcePath, entryName string, fileID uint32, opts ...Options) (*File, error) {
@@ -113,6 +116,7 @@ func Parse(data []byte, sourcePath, entryName string, fileID uint32, opts ...Opt
 	if err := f.parseAnnotations(data); err != nil {
 		return nil, err
 	}
+	f.parseHiddenApi(data)
 	f.sortClassData()
 	return f, nil
 }

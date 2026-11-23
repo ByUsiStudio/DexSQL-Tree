@@ -43,7 +43,7 @@ LSPosed 的 [DexSQL](https://github.com/LSPosed/dexsql-release) 证明了"DEX �
 flowchart LR
     subgraph Go["Go 引擎（单二进制）"]
         A["APK / DEX / JAR"] --> B["internal/dex<br/>DEX 解析 + 指令解码 + smali"]
-        B --> C["internal/store<br/>55 张关系表 / SQLite 物化"]
+        B --> C["internal/store<br/>56 张关系表 / SQLite 物化"]
         C --> D["CLI<br/>query · tables · smali"]
         C --> E["HTTP API<br/>/api/query · /api/tree"]
         B --> F["internal/tree<br/>调用图 + 环检测"]
@@ -159,11 +159,12 @@ mvn -pl dexsql-tree-gui javafx:run -Ddexsql.args="--connect http://127.0.0.1:876
 | `search --input X --keyword 关键词` | 一次搜类、方法、字段、字符串；`--kind` 可限定范围；直接扫模型，不建 SQLite |
 | `stats --input X [--json]` | 一屏总览：文件、类、方法、调用点、最大的类 |
 | `recipes [名称]` | 列出内置模板，给名称时打印 SQL 与参数 |
-| `tables [--json]` | 列出 55 张表与 3 个便捷视图 |
+| `tables [--json]` | 列出 56 张表与 3 个便捷视图 |
 | `tree --input X --method D` | 调用树；`--direction callers\|callees`、`--depth`、`--format text\|json\|dot` |
 | `smali --input X --method D` | 反汇编单个方法 |
 | `serve --input X [--addr ...]` | HTTP API + Web UI |
 | `mcp [--input X]` | stdio MCP 服务器 |
+| `cache list\|clear\|path\|info` | 管理磁盘目录缓存 |
 | `lang set zh --write` | 把中文提示写入 shell 启动文件 |
 
 ### 中文提示
@@ -214,6 +215,32 @@ dexsql-tree recipes               # 全部模板
 ```
 
 内置模板：`callers`、`callees`、`methods-like`、`strings-like`、`api-usage`、`class-info`、`big-methods`、`urls`。参数会被安全转义，注入的多语句会被只读守卫拒绝。
+
+### 打开速度：缓存与档位
+
+打开一个大包只做一次，重复查询是常态。`--cache` 把物化结果留在磁盘上，第二次打开直接从目录挂载：
+
+```bash
+dexsql-tree query --input vlc.apk --cache --sql "SELECT count(*) FROM methods"
+# 首次 32.7 s；同一条命令再跑一次 0.55 s
+
+dexsql-tree cache list          # 缓存了什么、占多少空间
+dexsql-tree cache info --input vlc.apk
+dexsql-tree cache clear         # 全部删掉
+```
+
+缓存键包含路径、大小、修改时间、引擎版本、档位与 `--debug`，所以换了文件或换了设置会自动重建，不会读到旧数据。默认位置是系统缓存目录，可用 `DEXSQL_TREE_CACHE` 或 `--cache-dir` 覆盖。
+
+`--profile` 控制物化多少：
+
+| 档位 | 内容 | 用途 |
+| --- | --- | --- |
+| `fast`（默认） | 实体、引用、字节码、调用点、静态字段初值 | 找类、找方法、看调用关系、查字符串 |
+| `full` | 再加上注解、注解元素、参数注解 | 需要读 `@Keep`、`@JsonProperty`、R8 注解等 |
+
+两档的**表结构完全一致**，区别只是注解相关表有没有行。需要注解时加 `--profile full` 即可，其余查询不用改。
+
+`--jobs N` 控制多 DEX 的解析并行度，默认等于 CPU 核数；`--disk` 把目录放在临时文件里，用时间换内存。
 
 两个开关控制"打开时做什么"：
 
@@ -308,6 +335,7 @@ Ljava/io/PrintStream;->println(Ljava/lang/String;)V
 | `list_tables` / `describe_table` | 表目录与列定义 |
 | `query` | 只读 SQL，默认最多 200 行 |
 | `search` | 关键词搜索类/方法/字段/字符串，免写 SQL |
+| `describe_input` | 不建目录，只报输入的规模 |
 | `run_recipe` / `list_recipes` | 运行内置参数化查询 |
 | `call_tree` | 调用者/被调用者树 |
 | `smali` | 单方法反汇编 |
@@ -320,12 +348,14 @@ Ljava/io/PrintStream;->println(Ljava/lang/String;)V
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/health` | `{ok, version, lang}` |
+| GET | `/api/health` | `{ok, version, lang, profile, cache}` |
 | GET | `/api/datasets` | 已加载数据集与统计 |
 | POST | `/api/datasets` | `{path}`，解析并注册 |
 | GET | `/api/tables` | 表与视图及列 |
 | GET | `/api/table?name=methods` | 单个关系定义 |
 | GET | `/api/recipes[?name=callers]` | 内置模板目录或单个模板 |
+| GET | `/api/search?keyword=X&kind=class` | 关键词搜索，免写 SQL |
+| GET/DELETE | `/api/cache` | 缓存状态 / 清空 |
 | POST | `/api/query` | `{sql, limit, dataset}` 或 `{recipe, args, limit, dataset}` |
 | POST | `/api/tree` | `{method, direction, depth, maxNodes, dataset}` |
 | GET | `/api/smali?method=...` | 反汇编文本 |
@@ -356,7 +386,8 @@ dexsql-tree/
 │   └── dexgen/            生成演示 DEX/APK
 ├── internal/
 │   ├── dex/               DEX 解析、指令解码、debug_info、注解、smali、APK 读取
-│   ├── store/             SQLite 物化、55 张表、视图、查询模板、只读守卫
+│   ├── store/             SQLite 物化、56 张表、视图、查询模板、只读守卫
+│   ├── cache/             磁盘目录缓存（键、列表、清理、残留回收）
 │   ├── tree/              调用图、树构建、环检测、DOT 输出
 │   ├── api/               HTTP API 与内置 Playground
 │   ├── mcp/               stdio MCP 服务器
@@ -377,45 +408,54 @@ dexsql-tree/
 
 **已实现**
 
-- DEX 035–039 常用节：字符串池、type/proto/field/method id、class_def、class_data、code_item、try/catch、debug_info、注解目录与编码值、method_handle、call_site、map_list、encoded_array。
+- DEX 035–041 常用节：字符串池、type/proto/field/method id、class_def、class_data、code_item、try/catch、debug_info、注解目录与编码值、method_handle、call_site、map_list、encoded_array、hiddenapi 标志表。DEX 041 容器会拆成多个逻辑 DEX（`classes.dex#2`），`file_id` 保持稳定。
 - MUTF-8 解码（含 U+0000 与代理对）、Java 风格类型名、Dalvik 指令长度与引用提取、常量提取、smali 文本。
-- 55 张关系表，覆盖实体、引用、字节码、注解、调试信息与 DEX 结构；另有 `v_methods`、`v_fields`、`v_overview` 三个便捷视图。
+- 56 张关系表，覆盖实体、引用、字节码、注解、调试信息、隐藏 API 与 DEX 结构；另有 `v_methods`、`v_fields`、`v_overview` 三个便捷视图。
 - 8 个内置查询模板（调用者、被调用者、API 使用量、最大方法、疑似凭据字符串等），CLI/HTTP/MCP 共用。
 - 调用图（按调用点计数）与带环检测的树视图。
 - 中英双语 CLI（`DEXSQL_TREE_ZH`）、关键词搜索与一屏统计。
+- 磁盘目录缓存（`--cache`）与两档物化（`--profile fast|full`）。
+- 多 DEX 并行解析（`--jobs`）与 8 行定宽批量插入。
 - 只读保护：`PRAGMA query_only=ON` + 语句白名单。
 - 9 个交叉编译目标，覆盖 amd64/arm64/armv7。
 
-**真实 APK 实测（Linux x64，Go 1.21，内存/磁盘两种模式）**
+**性能（Linux x64，12 核，`--profile fast`）**
 
-| 样本 | 体积 | DEX 字节 | 方法数 | 调用点 | 默认（内存） | `--disk` |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
-| F-Droid `com.termux.boot` | 26 KB | 6 KB | 64 | 0 | 0.01 s / 12 MB | — |
-| F-Droid `getback_gps` | 684 KB | 825 KB | 7,281 | 26,520 | 1.03 s / 88 MB | — |
-| F-Droid `com.fsck.k9` | 11 MB | 12 MB | 68,095 | 348,191 | 18.7 s / 1.45 GB | 17.8 s / 549 MB |
-| F-Droid `pilipala` | 22 MB | 3.1 MB | 29,740 | 80,355 | 4.8 s / 294 MB | — |
-| F-Droid `org.videolan.vlc` | 49 MB | 38.6 MB | 270,289 | 736,471 | 55.7 s / 3.87 GB | 55.1 s / 1.27 GB |
+| 样本 | 体积 | 方法数 | 0.2.0 | 0.3.0 冷启动 | 0.3.0 再次打开 |
+| --- | ---: | ---: | --- | --- | --- |
+| F-Droid `com.fsck.k9` | 11 MB | 68,095 | 18.7 s / 1.45 GB | **12.0 s / 500 MB** | **0.44 s / 230 MB** |
+| F-Droid `org.videolan.vlc` | 46 MB | 270,153 | 55.7 s / 3.87 GB | **32.7 s / 1.32 GB** | **0.55 s / 860 MB** |
 
-行号表（`--debug`）是单独的开销：`k9` 有 725 万条 position，开启后耗时约 50 s、磁盘模式内存约 0.94 GB。默认关闭，只解析 `debug_info` 头部。
+再次打开不是"部分命中"：解析仍然完整（调用树和 smali 依赖内存模型），只跳过 SQLite 物化。键由绝对路径、大小、修改时间、引擎版本、档位与 `--debug` 共同决定，改文件或改设置都会重建。
+
+单项收益（以 K-9 为例，冷启动 16.7 s 为 0.2.0 算法基线）：
+
+| 改动 | 效果 |
+| --- | --- |
+| 8 行定宽批量插入 | 16.7 s → 11.6 s（-30%）。批次更大反而变慢：每个绑定参数有一次反射开销 |
+| `--profile fast` 跳过注解表 | VLC 39.4 s → 32.7 s（-17%） |
+| 多 DEX 并行解析（6 dex） | 33.3 s → 30.9 s（-7%）；解析只占小包总时间的 3–5%，大头在物化 |
+| `--cache` | 12.0 s → 0.44 s（25 倍以上） |
+| `--disk` | 内存 3.59 GB → 1.31 GB，时间基本不变 |
+
+行号表（`--debug`）仍是单独开销：`k9` 有 725 万条 position，开启后耗时约 50 s。默认关闭，只解析 `debug_info` 头部。
 
 **当前限制（请按需评估）**
 
-1. **物化模型**：所有表在打开时写入 SQLite（默认内存，`--disk` 为临时文件）。数据本身随调用点/字符串引用线性增长，几十 MB 的 DEX 需要 GB 级内存或 `--disk`。DexSQL 采用列式与惰性准备，这是它更快的原因；这里优先选择"实现简单、SQL 完整、可审计"。
-2. **未做 041 容器拆分**：DEX 041 的多逻辑 DEX 会被当成一个文件；`dex_files` 不会合成 `classes.dex#2`。
-3. **`hiddenapi_flags` 未实现**：该节位于 DEX 尾部，当前版本未解析。
-4. **写入是单线程逐行插入**：批量多行 INSERT 在纯 Go SQLite 驱动上反而更慢（语句重新编译），已回退；并行解析多 DEX 尚未实现。
-5. **大样本以开源 APK 验证**：已覆盖 6 个 DEX、38.6 MB 的 VLC，但未做商业加固/混淆包的基准。
-6. **JavaFX 桌面端未在真实显示器上做交互测试**：只验证了编译与客户端↔引擎的端到端调用。
-7. SQLite 关键字冲突：`method_refs."index"` 需要引号。
+1. **物化模型**：所有表在打开时写入 SQLite。数据本身随调用点/字符串引用线性增长，几十 MB 的 DEX 需要 GB 级内存或 `--disk`/`--cache`。DexSQL 采用列式与惰性准备，这是它更快的原因；这里优先选择"实现简单、SQL 完整、可审计"。
+2. **首次打开仍然慢**：46 MB 样本约 33 s。瓶颈是 170 万行逐行写入，而纯 Go 驱动上多行 INSERT 的最优点只有 8 行；要再快一个量级需要改数据布局（列式或按需物化），不是调参能解决的。
+3. **`hiddenapi_flags` 是保守解析**：按 class_defs 顺序读 uleb128，遇到越界即停止并记 warning；测试覆盖了截断与非法长度，但未在大量商业包上做过统计校验。
+4. **大样本以开源 APK 验证**：已覆盖 6 个 DEX、39 MB 的 VLC，但未做商业加固/混淆包的基准。
+5. **JavaFX 桌面端未在真实显示器上做交互回归**：分页、取消、内联报错的逻辑有编译与端到端验证，但没有在物理显示器上逐项点过。
+6. SQLite 关键字冲突：`method_refs."index"` 需要引号。
 
 **路线图**
 
-- 并行解析多 DEX + 更快的写入路径，降低大包打开时间
-- 模板与视图继续扩充（override 关系、xref 汇总）
-- 持久化缓存（`.dxsql`），支持 `query-cache`
-- 041 容器拆分与 `hiddenapi_flags`
+- **新手体验**（下一版重点，见 [docs/roadmap-0.4.0.md](docs/roadmap-0.4.0.md)）：`start` 子命令、任务导向模板、错误附带建议、GUI 示例卡片
+- 按需物化：只建 SQL 里真正引用到的表，把 46 MB 样本的首次打开压到 10 s 内
 - 覆盖方法/字段的 override 关系展开（当前只按字节码直接引用）
-- JavaFX 端虚拟化大结果集、SQL 语法高亮
+- 模板与视图继续扩充（xref 汇总、签名对比）
+- JavaFX：SQL 语法高亮、结果导出 CSV、深色/浅色主题切换
 
 ---
 

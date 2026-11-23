@@ -9,6 +9,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/byusi-studio/dexsql-tree/internal/cache"
 	"github.com/byusi-studio/dexsql-tree/internal/dex"
 	"github.com/byusi-studio/dexsql-tree/internal/store"
 	"github.com/byusi-studio/dexsql-tree/internal/tree"
@@ -38,7 +39,15 @@ type Server struct {
 	// Debug controls line-number materialisation for datasets opened via MCP.
 	Debug bool
 	// Disk materialises datasets in a temporary file instead of memory.
-	Disk    bool
+	Disk bool
+	// Profile selects fast or full materialisation. Empty means fast.
+	Profile store.Profile
+	// Cache enables the persistent catalog cache for datasets opened later.
+	Cache bool
+	// CacheDir overrides the cache location; empty means the user cache dir.
+	CacheDir string
+	// Version is folded into cache keys.
+	Version string
 	mu      sync.Mutex
 	stores  map[string]*store.Store
 	graphs  map[string]*tree.Graph
@@ -69,7 +78,20 @@ func (s *Server) Open(path string) (string, *store.Store, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	st, err := store.Open(c, store.Options{Disk: s.Disk})
+	profile := s.Profile
+	if profile == "" {
+		profile = store.ProfileFast
+	}
+	opt := store.Options{Disk: s.Disk, Profile: profile}
+	if s.Cache {
+		dir := s.CacheDir
+		if dir == "" {
+			dir = cache.Dir()
+		}
+		opt.CacheDir = dir
+		opt.CacheKey = cache.Key([]string{path}, string(profile), s.Version, s.Debug)
+	}
+	st, err := store.Open(c, opt)
 	if err != nil {
 		return "", nil, err
 	}
@@ -152,7 +174,7 @@ func (s *Server) handle(req rpcRequest) {
 			"capabilities": map[string]any{
 				"tools": map[string]any{},
 			},
-			"serverInfo": map[string]any{"name": "dexsql-tree", "version": "0.1.0"},
+			"serverInfo": map[string]any{"name": "dexsql-tree", "version": s.Version},
 		})
 	case "ping":
 		s.reply(req.ID, map[string]any{})
@@ -192,6 +214,17 @@ var toolDefs = []map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{"type": "string", "description": "Absolute path to the input file."},
+			},
+			"required": []string{"path"},
+		},
+	},
+	{
+		"name":        "describe_input",
+		"description": "Summarise an APK/DEX without building the SQL catalog: dex entries, class/method/string counts. Use it to decide whether opening the dataset is worth it.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "APK, DEX, JAR or ZIP path."},
 			},
 			"required": []string{"path"},
 		},
@@ -304,12 +337,33 @@ func (s *Server) callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return jsonText(map[string]any{"dataset": id, "path": a.Path, "stats": st.Stats})
+		return jsonText(map[string]any{
+			"dataset": id, "path": a.Path, "stats": st.Stats,
+			"profile": string(st.Profile), "cached": st.Cached,
+		})
+	case "describe_input":
+		var a struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return "", err
+		}
+		c, err := dex.Load(a.Path, dex.Options{Debug: s.Debug})
+		if err != nil {
+			return "", err
+		}
+		return jsonText(map[string]any{
+			"path": a.Path, "dex_entries": c.EntryName, "stats": c.Stats(),
+			"warnings": c.Warnings,
+		})
 	case "list_datasets":
 		s.mu.Lock()
 		out := make([]map[string]any, 0, len(s.stores))
 		for id, st := range s.stores {
-			out = append(out, map[string]any{"dataset": id, "path": st.Container.Path, "stats": st.Stats})
+			out = append(out, map[string]any{
+				"dataset": id, "path": st.Container.Path, "stats": st.Stats,
+				"profile": string(st.Profile), "cached": st.Cached,
+			})
 		}
 		s.mu.Unlock()
 		return jsonText(out)

@@ -99,7 +99,7 @@
 }
 
 .button:disabled {
-    -fx-opacity: 0.55;
+    -fx-opacity: 0.38;
 }
 
 .tab-pane .tab-header-area .tab-header-background {
@@ -225,4 +225,169 @@
 .scroll-bar .thumb {
     -fx-background-color: #2c3748;
     -fx-background-radius: 4;
+}
+
+/* ---------------------------------------------------------------- v0.3.0 */
+
+.status-on {
+    -fx-fill: #5cc8b0;
+}
+
+.status-off {
+    -fx-fill: #55606f;
+}
+
+.banner {
+    -fx-padding: 8 12 8 12;
+    -fx-background-radius: 6;
+    -fx-border-radius: 6;
+    -fx-font-size: 12px;
+}
+
+.banner-error {
+    -fx-background-color: #2a1a1d;
+    -fx-border-color: #6b2d34;
+    -fx-text-fill: #f0a3a9;
+}
+
+.banner-info {
+    -fx-background-color: #16222a;
+    -fx-border-color: #2c4855;
+    -fx-text-fill: #9fc7d8;
+}
+
+.button.ghost {
+    -fx-background-color: transparent;
+    -fx-border-color: #2c3748;
+    -fx-text-fill: #8b97a8;
+    -fx-padding: 5 10 5 10;
+}
+
+.button.ghost:hover {
+    -fx-text-fill: #d7dee8;
+    -fx-border-color: #3d6b61;
+}
+
+.button.danger {
+    -fx-background-color: transparent;
+    -fx-border-color: #6b2d34;
+    -fx-text-fill: #e06c75;
+}
+
+.button.danger:hover {
+    -fx-background-color: #2a1a1d;
+}
+
+.check-box.chip {
+    -fx-text-fill: #8b97a8;
+    -fx-font-size: 11.5px;
+    -fx-padding: 2 6 2 2;
+}
+
+.check-box.chip:selected .mark {
+    -fx-background-color: #08120f;
+}
+
+.check-box.chip .box {
+    -fx-background-color: #1b222c;
+    -fx-border-color: #2c3748;
+    -fx-border-radius: 3;
+    -fx-background-radius: 3;
+}
+
+.check-box.chip:selected .box {
+    -fx-background-color: #5cc8b0;
+    -fx-border-color: #5cc8b0;
+}
+
+.combo-box .list-cell {
+    -fx-text-fill: #d7dee8;
+    -fx-background-color: #1b222c;
+}
+
+.combo-box-popup .list-view {
+    -fx-background-color: #1b222c;
+    -fx-border-color: #263041;
+}
+
+.table-view:focused, .list-view:focused, .text-area:focused, .text-field:focused {
+    -fx-border-color: #3d6b61;
+}
+
+.label.dataset-label {
+    -fx-text-fill: #5cc8b0;
+}
+
+.tooltip {
+    -fx-background-color: #1b222c;
+    -fx-text-fill: #d7dee8;
+    -fx-border-color: #263041;
+    -fx-font-size: 11.5px;
+}
+
+.dialog-pane {
+    -fx-background-color: #151a22;
+}
+
+.dialog-pane .label {
+    -fx-text-fill: #d7dee8;
+}
+
+/* Plain labels inherit the dark theme instead of the platform default. */
+.root-pane .label {
+    -fx-text-fill: #c3cdd9;
+}
+
+.root-pane .label.hint, .root-pane .label.tagline, .root-pane .label.section-title {
+    -fx-text-fill: #8b97a8;
+}
+
+.spinner {
+    -fx-background-color: #1b222c;
+}
+
+.spinner .text-field {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+}
+
+.spinner .increment-arrow-button,
+.spinner .decrement-arrow-button {
+    -fx-background-color: #1b222c;
+}
+
+.spinner .increment-arrow,
+.spinner .decrement-arrow {
+    -fx-background-color: #8b97a8;
+}
+
+.combo-box .arrow-button {
+    -fx-background-color: transparent;
+}
+
+.combo-box .arrow {
+    -fx-background-color: #8b97a8;
+}
+
+.check-box {
+    -fx-text-fill: #c3cdd9;
+}
+
+.table-view .virtual-flow .scroll-bar .thumb,
+.tree-view .virtual-flow .scroll-bar .thumb {
+    -fx-background-color: #2c3748;
+}
+
+/* Alert header uses the platform's light gradient unless it is overridden. */
+.dialog-pane > .header-panel {
+    -fx-background-color: #1b222c;
+}
+
+.dialog-pane > .header-panel .label {
+    -fx-text-fill: #d7dee8;
+    -fx-font-size: 13px;
+}
+
+.dialog-pane > .content {
+    -fx-padding: 12;
 }

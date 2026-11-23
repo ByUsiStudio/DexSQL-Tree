@@ -26,7 +26,17 @@ func retention(v uint32) string {
 }
 
 func (l *loader) annotations() error {
+	// The annotation tables are the largest part of the catalog by row count and
+	// the least queried, so the fast profile skips their expansion while still
+	// writing static field initial values (which are cheap and useful).
+	full := l.profile != ProfileFast
 	for _, f := range l.s.Container.Files {
+		if !full {
+			if err := l.staticValues(f); err != nil {
+				return err
+			}
+			continue
+		}
 		owners := map[uint32][]annOwner{}
 		addSet := func(off uint32, o annOwner) {
 			if off == 0 {
@@ -265,30 +275,35 @@ func (l *loader) annotations() error {
 			}
 		}
 
-		for i := range f.Classes {
-			c := &f.Classes[i]
-			if c.ClassData == nil || len(c.StaticValues) == 0 {
-				continue
+	}
+	return nil
+}
+
+// staticValues writes class_static_values without touching annotations.
+func (l *loader) staticValues(f *dex.File) error {
+	for i := range f.Classes {
+		c := &f.Classes[i]
+		if c.ClassData == nil || len(c.StaticValues) == 0 {
+			continue
+		}
+		for j, v := range c.StaticValues {
+			var fieldIdx any
+			if j < len(c.ClassData.StaticFields) {
+				fieldIdx = int64(c.ClassData.StaticFields[j].FieldIdx)
 			}
-			for j, v := range c.StaticValues {
-				var fieldIdx any
-				if j < len(c.ClassData.StaticFields) {
-					fieldIdx = int64(c.ClassData.StaticFields[j].FieldIdx)
-				}
-				var vidx, vi64, vf64 any
-				if v.HasIdx {
-					vidx = int64(v.ValueIdx)
-				}
-				if isNumericKind(v.Kind) {
-					vi64 = v.I64
-				}
-				if v.HasFloat {
-					vf64 = v.F64
-				}
-				if err := l.ins("class_static_values", int64(f.FileID), int64(c.ClassIdx),
-					int64(c.StaticValuesOff), int64(j), fieldIdx, v.Kind, vidx, vi64, vf64); err != nil {
-					return err
-				}
+			var vidx, vi64, vf64 any
+			if v.HasIdx {
+				vidx = int64(v.ValueIdx)
+			}
+			if isNumericKind(v.Kind) {
+				vi64 = v.I64
+			}
+			if v.HasFloat {
+				vf64 = v.F64
+			}
+			if err := l.ins("class_static_values", int64(f.FileID), int64(c.ClassIdx),
+				int64(c.StaticValuesOff), int64(j), fieldIdx, v.Kind, vidx, vi64, vf64); err != nil {
+				return err
 			}
 		}
 	}

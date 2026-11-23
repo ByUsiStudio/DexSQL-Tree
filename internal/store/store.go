@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/byusi-studio/dexsql-tree/internal/cache"
 	"github.com/byusi-studio/dexsql-tree/internal/dex"
 	_ "modernc.org/sqlite"
 )
@@ -21,7 +22,35 @@ type Store struct {
 	Container *dex.Container
 	Warnings  []string
 	Stats     dex.Stats
-	path      string
+	// Cached reports that this catalog was loaded from the on-disk cache
+	// instead of being materialised in this process.
+	Cached bool
+	// Profile records which materialisation profile produced the catalog.
+	Profile Profile
+	path    string
+}
+
+// Profile selects how much of the DEX model is written to SQL. "fast" skips the
+// annotation tables, which are the largest and least frequently queried part of
+// the catalog; the tables still exist and simply stay empty.
+type Profile string
+
+const (
+	// ProfileFast materialises entities, references, bytecode and call sites.
+	ProfileFast Profile = "fast"
+	// ProfileFull additionally materialises annotations and static values.
+	ProfileFull Profile = "full"
+)
+
+// ParseProfile validates a user-supplied profile name.
+func ParseProfile(s string) (Profile, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "fast", "default", "slim":
+		return ProfileFast, nil
+	case "full", "all", "annotations":
+		return ProfileFull, nil
+	}
+	return "", fmt.Errorf("unknown profile %q (use fast or full)", s)
 }
 
 // Options selects where the materialised catalog lives. The default in-memory
@@ -31,20 +60,54 @@ type Options struct {
 	Disk    bool
 	CacheMB int
 	TempDir string
+	// Profile defaults to ProfileFast.
+	Profile Profile
+	// CacheDir and CacheKey enable the persistent catalog cache. Both must be
+	// set; CacheKey normally comes from cache.Key.
+	CacheDir string
+	CacheKey string
 }
 
 // Open materialises an already-loaded container into a read-only SQLite view.
 // All relations are physical tables, which keeps the query surface identical to
 // the documented schema without virtual-table extensions.
+//
+// When CacheDir and CacheKey are set the catalog is written to
+// <CacheDir>/<CacheKey>.db and a later call with the same key mounts that file
+// read-only, skipping materialisation entirely.
 func Open(c *dex.Container, opts ...Options) (*Store, error) {
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	profile := opt.Profile
+	if profile == "" {
+		profile = ProfileFast
+	}
+	cachePath := ""
+	if opt.CacheDir != "" && opt.CacheKey != "" {
+		cachePath = cache.Path(opt.CacheDir, opt.CacheKey)
+		if _, ok := cache.Stat(opt.CacheDir, opt.CacheKey); ok {
+			if s, err := openReadOnly(c, cachePath, profile, true); err == nil {
+				return s, nil
+			}
+			// A half-written or corrupt catalog must not be served twice.
+			os.Remove(cachePath)
+		}
+		if err := cache.Ensure(opt.CacheDir); err != nil {
+			return nil, err
+		}
+		cache.CleanStale(opt.CacheDir, time.Hour)
+	}
 	seq := atomic.AddInt64(&dbSeq, 1)
 	dsn := fmt.Sprintf("file:dexsqltree-%d?mode=memory&cache=shared", seq)
-	var tmpPath string
-	if opt.Disk {
+	tmpPath := ""
+	writePath := ""
+	if cachePath != "" {
+		writePath = fmt.Sprintf("%s.tmp%d", cachePath, os.Getpid())
+		tmpPath = writePath
+		dsn = "file:" + filepath.ToSlash(writePath) + "?mode=rwc"
+	} else if opt.Disk {
 		dir := opt.TempDir
 		if dir == "" {
 			dir = os.TempDir()
@@ -58,14 +121,14 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{DB: db, Container: c, Stats: c.Stats(), Warnings: append([]string{}, c.Warnings...), path: tmpPath}
+	s := &Store{DB: db, Container: c, Stats: c.Stats(), Warnings: append([]string{}, c.Warnings...), path: tmpPath, Profile: profile}
 	fail := func(err error) (*Store, error) {
 		db.Close()
 		s.removeFiles()
 		return nil, err
 	}
 	cacheKB := -200000
-	if opt.Disk {
+	if opt.Disk || cachePath != "" {
 		cacheKB = -65536
 	}
 	if opt.CacheMB > 0 {
@@ -75,7 +138,7 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 		"PRAGMA journal_mode=OFF", "PRAGMA synchronous=OFF",
 		fmt.Sprintf("PRAGMA cache_size=%d", cacheKB), "PRAGMA locking_mode=EXCLUSIVE",
 	}
-	if opt.Disk {
+	if opt.Disk || cachePath != "" {
 		pragmas = append(pragmas, "PRAGMA temp_store=FILE")
 	} else {
 		pragmas = append(pragmas, "PRAGMA temp_store=MEMORY")
@@ -90,7 +153,7 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 			return fail(fmt.Errorf("schema: %w (%s)", err, stmt))
 		}
 	}
-	if err := s.load(); err != nil {
+	if err := s.load(profile); err != nil {
 		return fail(err)
 	}
 	for _, stmt := range viewDDL {
@@ -101,7 +164,56 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 	if _, err := db.Exec("PRAGMA query_only=ON"); err != nil {
 		return fail(err)
 	}
+	if cachePath != "" {
+		// Close first so the file is complete on disk, then publish it and
+		// reopen read-only. Publishing by rename keeps readers from ever seeing
+		// a partially written catalog.
+		if err := db.Close(); err != nil {
+			os.Remove(writePath)
+			return nil, err
+		}
+		s.path = ""
+		if err := os.Rename(writePath, cachePath); err != nil {
+			os.Remove(writePath)
+			return nil, err
+		}
+		return openReadOnly(c, cachePath, profile, false)
+	}
 	return s, nil
+}
+
+// openReadOnly mounts an existing catalog. The container is still parsed by the
+// caller, so call trees and smali keep working; only materialisation is skipped.
+func openReadOnly(c *dex.Container, path string, profile Profile, cached bool) (*Store, error) {
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&cache=private"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	for _, p := range []string{"PRAGMA cache_size=-65536", "PRAGMA temp_store=FILE", "PRAGMA query_only=ON"} {
+		if _, err := db.Exec(p); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	// A short or foreign file is opened by SQLite as an empty database, so the
+	// only reliable test is that the catalog tables are actually there.
+	var n int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='methods'`).Scan(&n); err != nil || n == 0 {
+		db.Close()
+		return nil, fmt.Errorf("catalog %s is not usable", path)
+	}
+	return &Store{
+		DB:        db,
+		Container: c,
+		Stats:     c.Stats(),
+		Warnings:  append([]string{}, c.Warnings...),
+		Cached:    cached,
+		Profile:   profile,
+	}, nil
 }
 
 // Close releases the database and removes the temporary file, if any.
@@ -121,21 +233,127 @@ func (s *Store) removeFiles() {
 }
 
 type loader struct {
-	tx    *sql.Tx
-	stmts map[string]*sql.Stmt
-	s     *Store
+	tx       *sql.Tx
+	stmts    map[string]*sql.Stmt
+	s        *Store
+	profile  Profile
+	batches  map[string]*tableBatch
+	batchMax map[string]int
 }
 
-func (s *Store) load() error {
+// tableBatch groups rows into a multi-row INSERT. A benchmark on the pure-Go
+// driver shows a shallow optimum: 8 rows per statement is ~27% faster than one
+// row per statement, while 128 rows is slower than no batching at all, because
+// every bound parameter costs a reflection hop. The width is therefore capped
+// so a statement never exceeds 80 parameters.
+type tableBatch struct {
+	width int
+	rows  []any
+	count int
+	stmts map[int]*sql.Stmt
+}
+
+const batchMaxParams = 80
+
+func (b *tableBatch) stmt(tx *sql.Tx, table string, n int) (*sql.Stmt, error) {
+	if b.stmts == nil {
+		b.stmts = map[int]*sql.Stmt{}
+	}
+	if st, ok := b.stmts[n]; ok {
+		return st, nil
+	}
+	row := "(" + strings.TrimSuffix(strings.Repeat("?,", b.width), ",") + ")"
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO " + quote(table) + " VALUES ")
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(row)
+	}
+	st, err := tx.Prepare(sb.String())
+	if err != nil {
+		return nil, fmt.Errorf("prepare %s x%d: %w", table, n, err)
+	}
+	b.stmts[n] = st
+	return st, nil
+}
+
+// ins inserts one row into a catalog table, preparing the statement on first
+// use. Column order must match the catalog.
+//
+// Multi-row INSERT was measured on an 11 MB APK and was consistently slower:
+// the pure-Go driver re-binds every parameter of a wide statement, so a fixed
+// 3000-parameter batch cost twice what one row per Exec costs. One prepared
+// single-row statement per table stays the fastest option here.
+func (l *loader) ins(table string, vals ...any) error {
+	b := l.batches[table]
+	if b == nil {
+		n := len(CatalogByName[table].Cols)
+		if len(vals) != n {
+			return fmt.Errorf("store: %s expects %d columns, got %d", table, n, len(vals))
+		}
+		max := batchMaxParams / n
+		if max < 1 {
+			max = 1
+		}
+		b = &tableBatch{width: n}
+		b.stmts = map[int]*sql.Stmt{}
+		l.batches[table] = b
+		l.batchMax[table] = max
+	}
+	if len(vals) != b.width {
+		return fmt.Errorf("store: %s expects %d columns, got %d", table, b.width, len(vals))
+	}
+	b.rows = append(b.rows, vals...)
+	b.count++
+	if b.count == l.batchMax[table] {
+		return l.writeBatch(table, b)
+	}
+	return nil
+}
+
+func (l *loader) writeBatch(table string, b *tableBatch) error {
+	if b.count == 0 {
+		return nil
+	}
+	st, err := b.stmt(l.tx, table, b.count)
+	if err != nil {
+		return err
+	}
+	if _, err := st.Exec(b.rows...); err != nil {
+		return fmt.Errorf("insert %s: %w", table, err)
+	}
+	b.rows = b.rows[:0]
+	b.count = 0
+	return nil
+}
+
+// flush writes the partial batch of every table.
+func (l *loader) flush() error {
+	for table, b := range l.batches {
+		if err := l.writeBatch(table, b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) load(profile Profile) error {
 	debug := os.Getenv("DEXSQL_DEBUG_LOAD") != ""
 
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
 	}
-	l := &loader{tx: tx, stmts: map[string]*sql.Stmt{}, s: s}
+	l := &loader{tx: tx, stmts: map[string]*sql.Stmt{}, s: s, profile: profile,
+		batches: map[string]*tableBatch{}, batchMax: map[string]int{}}
 	tLoad := time.Now()
 	if err := l.run(); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := l.flush(); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -171,46 +389,27 @@ var indexDDL = []string{
 	"CREATE INDEX idx_types_class ON types(file_id, descriptor)",
 }
 
-// ins inserts one row into a catalog table, preparing the statement on first
-// use. Column order must match the catalog.
-func (l *loader) ins(table string, vals ...any) error {
-	st, ok := l.stmts[table]
-	if !ok {
-		n := len(CatalogByName[table].Cols)
-		if len(vals) != n {
-			return fmt.Errorf("store: %s expects %d columns, got %d", table, n, len(vals))
-		}
-		q := "INSERT INTO " + quote(table) + " VALUES (" + strings.TrimSuffix(strings.Repeat("?,", n), ",") + ")"
-		var err error
-		st, err = l.tx.Prepare(q)
-		if err != nil {
-			return fmt.Errorf("prepare %s: %w", table, err)
-		}
-		l.stmts[table] = st
-	}
-	_, err := st.Exec(vals...)
-	return err
-}
-
 func (l *loader) run() error {
-	names := []string{
-		"dexFiles", "strings", "types", "protos", "fields", "methods",
-		"classes", "classMembers", "codeItems", "bytecodeRefs",
-		"annotations", "debugInfo", "layout",
+	type step struct {
+		name string
+		fn   func() error
 	}
-	steps := []func() error{
-		l.dexFiles, l.strings, l.types, l.protos, l.fields, l.methods,
-		l.classes, l.classMembers, l.codeItems, l.bytecodeRefs,
-		l.annotations, l.debugInfo, l.layout,
+	steps := []step{
+		{"dexFiles", l.dexFiles}, {"strings", l.strings}, {"types", l.types},
+		{"protos", l.protos}, {"fields", l.fields}, {"methods", l.methods},
+		{"classes", l.classes}, {"classMembers", l.classMembers},
+		{"codeItems", l.codeItems}, {"bytecodeRefs", l.bytecodeRefs},
+		{"annotations", l.annotations}, {"debugInfo", l.debugInfo},
+		{"hiddenApi", l.hiddenApi}, {"layout", l.layout},
 	}
 	debug := os.Getenv("DEXSQL_DEBUG_LOAD") != ""
-	for i, step := range steps {
+	for _, st := range steps {
 		t := time.Now()
-		if err := step(); err != nil {
+		if err := st.fn(); err != nil {
 			return err
 		}
 		if debug {
-			fmt.Fprintf(os.Stderr, "  %-14s %v\n", names[i], time.Since(t))
+			fmt.Fprintf(os.Stderr, "  %-14s %v\n", st.name, time.Since(t))
 		}
 	}
 	return nil

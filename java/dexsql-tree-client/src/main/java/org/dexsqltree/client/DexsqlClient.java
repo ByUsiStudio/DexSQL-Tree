@@ -14,19 +14,56 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 /**
- * Blocking client for the dexsql-tree HTTP API.
+ * Client for the dexsql-tree HTTP API.
  *
- * <p>The client is thread-safe: it holds no mutable state other than the
- * currently selected dataset id, which callers set explicitly.
+ * <p>Every request can be issued either blocking or through {@link #async},
+ * which runs on a shared daemon pool. The engine is single-writer per dataset
+ * but readers are independent, so a small fixed pool (one thread per core, at
+ * most eight) keeps the UI responsive while several queries, a tree and a
+ * disassembly are in flight.
+ *
+ * <p>Methods that take an explicit {@code dataset} never touch shared state;
+ * the {@code datasetId} field is only a convenience default for single-dataset
+ * sessions. That keeps the class safe to use from several threads at once.
  */
 public final class DexsqlClient {
+    private static final int CORE_POOL = Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+
+    private static final ExecutorService POOL = Executors.newFixedThreadPool(CORE_POOL, new ThreadFactory() {
+        private final AtomicInteger seq = new AtomicInteger();
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "dexsql-http-" + seq.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        }
+    });
+
     private final URI base;
     private final HttpClient http;
-    private final ObjectMapper mapper = new ObjectMapper();
+    // findAndRegisterModules picks up jackson-datatype-jsr310, which is required
+    // to read the Instant timestamps in CacheInfo.
+    private final ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
     private final Duration requestTimeout;
     private volatile String datasetId;
+
+    /** Shared worker pool used by the async methods and by GUI tasks. */
+    public static ExecutorService executor() {
+        return POOL;
+    }
+
+    public static int poolSize() {
+        return CORE_POOL;
+    }
 
     public DexsqlClient(String baseUrl) {
         this(baseUrl, Duration.ofMinutes(5));
@@ -39,6 +76,7 @@ public final class DexsqlClient {
         this.http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .followRedirects(HttpClient.Redirect.NORMAL)
+                .executor(POOL)
                 .build();
     }
 
@@ -46,7 +84,7 @@ public final class DexsqlClient {
         return base.toString();
     }
 
-    /** The dataset used by query/tree/smali when no explicit id is supplied. */
+    /** The dataset used when a call omits the dataset argument. */
     public String datasetId() {
         return datasetId;
     }
@@ -55,13 +93,18 @@ public final class DexsqlClient {
         this.datasetId = id;
     }
 
+    // ------------------------------------------------------------------ info
+
     public boolean health() {
         try {
-            JsonNode node = get("/api/health");
-            return node.path("ok").asBoolean(false);
+            return get("/api/health").path("ok").asBoolean(false);
         } catch (RuntimeException e) {
             return false;
         }
+    }
+
+    public Health healthInfo() {
+        return mapper.convertValue(get("/api/health"), Health.class);
     }
 
     public List<DatasetInfo> datasets() {
@@ -69,6 +112,15 @@ public final class DexsqlClient {
         List<DatasetInfo> out = new ArrayList<>();
         for (JsonNode d : node.path("datasets")) {
             out.add(mapper.convertValue(d, DatasetInfo.class));
+        }
+        return out;
+    }
+
+    public List<TableInfo> tables() {
+        JsonNode node = get("/api/tables");
+        List<TableInfo> out = new ArrayList<>();
+        for (JsonNode t : node.path("tables")) {
+            out.add(mapper.convertValue(t, TableInfo.class));
         }
         return out;
     }
@@ -83,44 +135,117 @@ public final class DexsqlClient {
         return info;
     }
 
-    public List<TableInfo> tables() {
-        JsonNode node = get("/api/tables");
-        List<TableInfo> out = new ArrayList<>();
-        for (JsonNode t : node.path("tables")) {
-            out.add(mapper.convertValue(t, TableInfo.class));
-        }
-        return out;
-    }
+    // --------------------------------------------------------------- queries
 
     public QueryResult query(String sql, int limit) {
-        ObjectNode body = mapper.createObjectNode();
-        body.put("sql", sql);
-        body.put("limit", limit);
-        if (datasetId != null) {
-            body.put("dataset", datasetId);
-        }
-        return post("/api/query", body, QueryResult.class);
+        return query(sql, limit, datasetId);
     }
 
     public QueryResult query(String sql) {
-        return query(sql, 1000);
+        return query(sql, 1000, datasetId);
+    }
+
+    public QueryResult query(String sql, int limit, String dataset) {
+        ObjectNode body = mapper.createObjectNode();
+        body.put("sql", sql);
+        body.put("limit", limit);
+        return post("/api/query", withDataset(body, dataset), QueryResult.class);
+    }
+
+    /** Runs a built-in recipe such as {@code callers} with its arguments. */
+    public QueryResult recipe(String name, java.util.Map<String, String> args, int limit, String dataset) {
+        ObjectNode body = mapper.createObjectNode();
+        body.put("recipe", name);
+        ObjectNode a = body.putObject("args");
+        if (args != null) {
+            args.forEach(a::put);
+        }
+        body.put("limit", limit);
+        return post("/api/query", withDataset(body, dataset), QueryResult.class);
+    }
+
+    /** Keyword search across classes, methods, fields and strings. */
+    public QueryResult search(String keyword, List<String> kinds, int limit, String dataset) {
+        StringBuilder url = new StringBuilder("/api/search?keyword=").append(urlEncode(keyword));
+        if (kinds != null) {
+            for (String k : kinds) {
+                url.append("&kind=").append(urlEncode(k));
+            }
+        }
+        url.append("&limit=").append(limit);
+        if (dataset != null && !dataset.isBlank()) {
+            url.append("&dataset=").append(urlEncode(dataset));
+        }
+        return mapper.convertValue(get(url.toString()), QueryResult.class);
     }
 
     public CallTree tree(String method, Direction direction, int depth) {
+        return tree(method, direction, depth, datasetId);
+    }
+
+    public CallTree tree(String method, Direction direction, int depth, String dataset) {
         ObjectNode body = mapper.createObjectNode();
         body.put("method", method);
         body.put("direction", direction.wire());
         body.put("depth", depth);
-        if (datasetId != null) {
-            body.put("dataset", datasetId);
-        }
-        return post("/api/tree", body, CallTree.class);
+        return post("/api/tree", withDataset(body, dataset), CallTree.class);
     }
 
     public String smali(String method) {
+        return smali(method, datasetId);
+    }
+
+    public String smali(String method, String dataset) {
         String url = "/api/smali?method=" + urlEncode(method)
-                + (datasetId == null ? "" : "&dataset=" + urlEncode(datasetId));
+                + (dataset == null || dataset.isBlank() ? "" : "&dataset=" + urlEncode(dataset));
         return get(url).path("smali").asText();
+    }
+
+    // ---------------------------------------------------------------- cache
+
+    public CacheInfo cache() {
+        return mapper.convertValue(get("/api/cache"), CacheInfo.class);
+    }
+
+    public CacheInfo clearCache() {
+        HttpRequest req = HttpRequest.newBuilder(base.resolve("/api/cache"))
+                .timeout(requestTimeout)
+                .header("accept", "application/json")
+                .DELETE()
+                .build();
+        send(req);
+        return cache();
+    }
+
+    // ---------------------------------------------------------------- async
+
+    public CompletableFuture<QueryResult> queryAsync(String sql, int limit, String dataset) {
+        return async(() -> query(sql, limit, dataset));
+    }
+
+    public CompletableFuture<QueryResult> searchAsync(String keyword, List<String> kinds, int limit, String dataset) {
+        return async(() -> search(keyword, kinds, limit, dataset));
+    }
+
+    public CompletableFuture<CallTree> treeAsync(String method, Direction dir, int depth, String dataset) {
+        return async(() -> tree(method, dir, depth, dataset));
+    }
+
+    public CompletableFuture<String> smaliAsync(String method, String dataset) {
+        return async(() -> smali(method, dataset));
+    }
+
+    public <T> CompletableFuture<T> async(Supplier<T> work) {
+        return CompletableFuture.supplyAsync(work, POOL);
+    }
+
+    // ------------------------------------------------------------- internals
+
+    private ObjectNode withDataset(ObjectNode body, String dataset) {
+        if (dataset != null && !dataset.isBlank()) {
+            body.put("dataset", dataset);
+        }
+        return body;
     }
 
     private JsonNode get(String path) {
@@ -147,8 +272,7 @@ public final class DexsqlClient {
     }
 
     private <T> T post(String path, JsonNode body, Class<T> type) {
-        JsonNode node = post(path, body);
-        return mapper.convertValue(node, type);
+        return mapper.convertValue(post(path, body), type);
     }
 
     private JsonNode send(HttpRequest req) {
@@ -171,7 +295,7 @@ public final class DexsqlClient {
             throw new DexsqlException("request failed: " + e.getMessage(), 0, e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new DexsqlException("interrupted", 0, e);
+            throw new DexsqlException("cancelled", 0, e);
         }
     }
 

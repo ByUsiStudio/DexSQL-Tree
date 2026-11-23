@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/byusi-studio/dexsql-tree/internal/cache"
 	"github.com/byusi-studio/dexsql-tree/internal/dex"
 	"github.com/byusi-studio/dexsql-tree/internal/i18n"
 	"github.com/byusi-studio/dexsql-tree/internal/store"
@@ -27,11 +28,17 @@ type Server struct {
 	// time and memory.
 	Debug bool
 	// Disk materialises datasets in a temporary file instead of memory.
-	Disk   bool
-	mu     sync.Mutex
-	stores map[string]*store.Store
-	graphs map[string]*tree.Graph
-	nextID int
+	Disk bool
+	// Profile selects fast or full materialisation. Empty means fast.
+	Profile store.Profile
+	// Cache enables the persistent catalog cache for datasets opened later.
+	Cache bool
+	// CacheDir overrides the cache location; empty means the user cache dir.
+	CacheDir string
+	mu       sync.Mutex
+	stores   map[string]*store.Store
+	graphs   map[string]*tree.Graph
+	nextID   int
 }
 
 // New returns an empty server.
@@ -63,11 +70,29 @@ func (s *Server) AddStore(id string, st *store.Store) {
 
 // Add loads a path and registers it.
 func (s *Server) Add(path string) (string, *store.Store, error) {
-	c, err := dex.Load(path, dex.Options{Debug: s.Debug})
+	return s.AddJobs(path, 0)
+}
+
+// AddJobs is Add with an explicit parallel decoder count.
+func (s *Server) AddJobs(path string, jobs int) (string, *store.Store, error) {
+	c, err := dex.Load(path, dex.Options{Debug: s.Debug, Jobs: jobs})
 	if err != nil {
 		return "", nil, err
 	}
-	st, err := store.Open(c, store.Options{Disk: s.Disk})
+	profile := s.Profile
+	if profile == "" {
+		profile = store.ProfileFast
+	}
+	opt := store.Options{Disk: s.Disk, Profile: profile}
+	if s.Cache {
+		dir := s.CacheDir
+		if dir == "" {
+			dir = cache.Dir()
+		}
+		opt.CacheDir = dir
+		opt.CacheKey = cache.Key([]string{path}, string(profile), Version, s.Debug)
+	}
+	st, err := store.Open(c, opt)
 	if err != nil {
 		return "", nil, err
 	}
@@ -91,7 +116,10 @@ func (s *Server) Handler() http.Handler {
 		w.Write(indexHTML)
 	})
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "version": Version, "lang": i18n.Lang()})
+		writeJSON(w, 200, map[string]any{
+			"ok": true, "version": Version, "lang": i18n.Lang(),
+			"profile": string(s.Profile), "cache": s.Cache,
+		})
 	})
 	mux.HandleFunc("/api/datasets", s.handleDatasets)
 	mux.HandleFunc("/api/tables", s.handleTables)
@@ -100,11 +128,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/query", s.handleQuery)
 	mux.HandleFunc("/api/tree", s.handleTree)
 	mux.HandleFunc("/api/smali", s.handleSmali)
+	mux.HandleFunc("/api/search", s.handleSearch)
+	mux.HandleFunc("/api/cache", s.handleCache)
 	return cors(mux)
 }
 
 // Version is reported by /api/health and the CLI.
-var Version = "0.2.0"
+var Version = "0.3.0"
 
 func cors(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -347,4 +377,71 @@ func ParseAddr(addr string) string {
 		return "127.0.0.1:8765"
 	}
 	return addr
+}
+
+// handleSearch answers keyword lookups without SQL. It scans the parsed model,
+// so it works even when the catalog was served from cache.
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	kw := strings.TrimSpace(q.Get("keyword"))
+	if kw == "" {
+		writeErr(w, 400, fmt.Errorf("keyword is required"))
+		return
+	}
+	st, err := s.lookup(q.Get("dataset"))
+	if err != nil {
+		writeErr(w, 404, err)
+		return
+	}
+	var kinds []string
+	for _, raw := range q["kind"] {
+		for _, k := range strings.Split(raw, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				kinds = append(kinds, k)
+			}
+		}
+	}
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > maxLimit {
+		limit = 100
+	}
+	res, err := st.Search(kw, kinds, limit)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, res)
+}
+
+// handleCache reports the catalog cache and lets a client clear it.
+func (s *Server) handleCache(w http.ResponseWriter, r *http.Request) {
+	dir := s.CacheDir
+	if dir == "" {
+		dir = cache.Dir()
+	}
+	switch r.Method {
+	case http.MethodGet:
+		ents, err := cache.List(dir)
+		if err != nil {
+			writeErr(w, 500, err)
+			return
+		}
+		var total int64
+		for _, e := range ents {
+			total += e.Size
+		}
+		writeJSON(w, 200, map[string]any{
+			"dir": dir, "enabled": s.Cache, "entries": ents,
+			"count": len(ents), "bytes": total,
+		})
+	case http.MethodDelete:
+		n, b, err := cache.Clear(dir)
+		if err != nil {
+			writeErr(w, 500, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"removed": n, "bytes": b})
+	default:
+		w.WriteHeader(405)
+	}
 }
