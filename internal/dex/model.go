@@ -308,6 +308,7 @@ type Local struct {
 // File is one logical DEX inside an input container.
 type File struct {
 	raw                []byte
+	debugPositions     bool
 	FileID             uint32
 	SourcePath         string
 	EntryName          string

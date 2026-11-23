@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sort"
 )
 
 var valueKindNames = map[byte]string{
@@ -233,8 +234,11 @@ func (f *File) parseAnnotationSet(data []byte, off uint32, cache map[uint32]*Ann
 	if s, ok := cache[off]; ok {
 		return s
 	}
+	if off == 0 || off%4 != 0 {
+		return nil
+	}
 	size, ok := readU32At(data, off)
-	if !ok || int(off)+4+int(size)*4 > len(data) {
+	if !ok || size > uint32(len(data)/4) || int(off)+4+int(size)*4 > len(data) {
 		return nil
 	}
 	s := &AnnotationSet{Off: off, Size: size}
@@ -268,21 +272,22 @@ func (f *File) parseAnnotations(data []byte) error {
 
 	for i := range f.Classes {
 		c := &f.Classes[i]
+		// annotations_directory_item is a 16-byte header followed by
+		// fields_size + annotated_methods_size + annotated_parameters_size
+		// eight-byte entries. There is no class_idx in the record: the owning
+		// class is the class_def_item that points here.
 		if c.AnnotationsOff == 0 || int(c.AnnotationsOff)+16 > len(data) {
 			continue
 		}
 		base := int(c.AnnotationsOff)
-		if base+20 > len(data) {
-			continue
-		}
-		d := &AnnotationDirectory{AnnotationsOff: c.AnnotationsOff}
-		d.ClassIdx = binary.LittleEndian.Uint32(data[base:])
-		classSetOff := binary.LittleEndian.Uint32(data[base+4:])
-		fieldsSize := binary.LittleEndian.Uint32(data[base+8:])
-		methodsSize := binary.LittleEndian.Uint32(data[base+12:])
-		paramsSize := binary.LittleEndian.Uint32(data[base+16:])
-		pos := base + 20
-		if fieldsSize+methodsSize+paramsSize > uint32(len(data)) {
+		d := &AnnotationDirectory{ClassIdx: uint32(i), AnnotationsOff: c.AnnotationsOff}
+		classSetOff := binary.LittleEndian.Uint32(data[base:])
+		fieldsSize := binary.LittleEndian.Uint32(data[base+4:])
+		methodsSize := binary.LittleEndian.Uint32(data[base+8:])
+		paramsSize := binary.LittleEndian.Uint32(data[base+12:])
+		pos := base + 16
+		total := uint64(fieldsSize) + uint64(methodsSize) + uint64(paramsSize)
+		if total > uint64(len(data))/8 || pos+int(total)*8 > len(data) {
 			f.Warnings = append(f.Warnings, fmt.Sprintf("class %s: implausible annotation directory", c.Descriptor))
 			continue
 		}
@@ -332,6 +337,7 @@ func (f *File) parseAnnotations(data []byte) error {
 	}
 
 	f.Annotations = ensureItems()
+	sort.Slice(f.Annotations, func(a, b int) bool { return f.Annotations[a].Off < f.Annotations[b].Off })
 	return nil
 }
 
@@ -343,7 +349,7 @@ func (f *File) parseAnnotationRefList(data []byte, off uint32, sets map[uint32]*
 		return rl
 	}
 	size, ok := readU32At(data, off)
-	if !ok || int(off)+4+int(size)*4 > len(data) {
+	if !ok || size > uint32(len(data)/4) || int(off)+4+int(size)*4 > len(data) {
 		return nil
 	}
 	rl := &AnnotationRefList{Off: off}

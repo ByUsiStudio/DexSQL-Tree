@@ -2,6 +2,11 @@
 
 本文件由 `dexsql-tree tables --json` 生成，与二进制内置目录一致。列类型为逻辑类型：`UInt32`/`Int64` 映射 SQLite INTEGER，`Float64` 映射 REAL，`Utf8`/`Utf8View` 映射 TEXT，`Boolean` 映射 0/1。
 
+两个使用约定：
+
+- `debug_positions` 与 `debug_locals` 默认是空表。它们由 `--debug` 开启；大型 DEX 的行号程序常常比代码本身更大（例如 11 MB 的 K-9 有 725 万条 position），默认不物化。
+- `method_refs."index"` 是 SQLite 关键字，查询时必须写成 `"index"` 或 `method_refs.[index]`。
+
 ## 一览
 
 | 关系 | 列数 | 说明 |
@@ -61,6 +66,28 @@
 | `call_sites` | 7 | DEX 038+ call_site_id_item summaries. |
 | `call_site_args` | 8 | Top-level encoded values of a call site. |
 | `method_handles` | 4 | DEX 038+ method_handle_item rows. |
+
+### 便捷视图
+
+视图不是新数据，只是把常用的 JOIN 预先写好。它们在打开数据时一次性创建，查询时才按需计算，因此不用时没有成本。
+
+| 视图 | 列数 | 说明 |
+| --- | ---: | --- |
+| `v_methods` | 14 | `methods` 左连接 `types`，补上 `java_class` 与 `is_public`/`is_static`/`is_constructor` |
+| `v_fields` | 7 | `fields` 左连接 `types`，补上 `java_class` |
+| `v_overview` | 2 | 每个关系一行，`row_count` 为行数，用于一眼看清输入规模 |
+
+```sql
+-- 不用自己写 methods JOIN types
+SELECT java_class, name, param_count
+FROM v_methods
+WHERE name = 'onCreate' AND is_public;
+
+-- 判断这个样本值不值得细查
+SELECT * FROM v_overview;
+```
+
+`java_class` 为 `demo.Hello` 这样的点分名；`class_descriptor` 仍是 `Ldemo/Hello;`，两者都在视图中。
 
 ## 列定义
 

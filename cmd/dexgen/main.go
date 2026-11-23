@@ -10,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dextest"
+	"github.com/byusi-studio/dexsql-tree/internal/dextest"
 )
 
 func main() {

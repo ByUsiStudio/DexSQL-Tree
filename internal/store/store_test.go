@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
-	"github.com/dexsql-tree/dexsql-tree/internal/dextest"
-	"github.com/dexsql-tree/dexsql-tree/internal/store"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/dextest"
+	"github.com/byusi-studio/dexsql-tree/internal/store"
 )
 
 func openHello(t *testing.T) *store.Store {

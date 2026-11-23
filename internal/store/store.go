@@ -3,11 +3,13 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,47 +24,101 @@ type Store struct {
 	path      string
 }
 
-// Open parses nothing; it materialises an already-loaded container into an
-// in-memory SQLite database. All relations are physical tables, which keeps the
-// query surface identical to the documented schema without virtual-table
-// extensions.
-func Open(c *dex.Container) (*Store, error) {
-	dsn := fmt.Sprintf("file:dexsqltree-%d?mode=memory&cache=shared", atomic.AddInt64(&dbSeq, 1))
+// Options selects where the materialised catalog lives. The default in-memory
+// database is fastest for small and medium inputs; Disk trades a temporary file
+// for a much smaller resident set, which matters for multi-dex APKs.
+type Options struct {
+	Disk    bool
+	CacheMB int
+	TempDir string
+}
+
+// Open materialises an already-loaded container into a read-only SQLite view.
+// All relations are physical tables, which keeps the query surface identical to
+// the documented schema without virtual-table extensions.
+func Open(c *dex.Container, opts ...Options) (*Store, error) {
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	seq := atomic.AddInt64(&dbSeq, 1)
+	dsn := fmt.Sprintf("file:dexsqltree-%d?mode=memory&cache=shared", seq)
+	var tmpPath string
+	if opt.Disk {
+		dir := opt.TempDir
+		if dir == "" {
+			dir = os.TempDir()
+		}
+		tmpPath = filepath.Join(dir, fmt.Sprintf("dexsqltree-%d-%d.db", os.Getpid(), seq))
+		dsn = "file:" + filepath.ToSlash(tmpPath) + "?mode=rwc"
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{DB: db, Container: c, Stats: c.Stats(), Warnings: append([]string{}, c.Warnings...)}
-	for _, t := range []string{
-		"PRAGMA journal_mode=OFF", "PRAGMA synchronous=OFF", "PRAGMA temp_store=MEMORY",
-		"PRAGMA cache_size=-200000", "PRAGMA locking_mode=EXCLUSIVE",
-	} {
+	s := &Store{DB: db, Container: c, Stats: c.Stats(), Warnings: append([]string{}, c.Warnings...), path: tmpPath}
+	fail := func(err error) (*Store, error) {
+		db.Close()
+		s.removeFiles()
+		return nil, err
+	}
+	cacheKB := -200000
+	if opt.Disk {
+		cacheKB = -65536
+	}
+	if opt.CacheMB > 0 {
+		cacheKB = -opt.CacheMB * 1024
+	}
+	pragmas := []string{
+		"PRAGMA journal_mode=OFF", "PRAGMA synchronous=OFF",
+		fmt.Sprintf("PRAGMA cache_size=%d", cacheKB), "PRAGMA locking_mode=EXCLUSIVE",
+	}
+	if opt.Disk {
+		pragmas = append(pragmas, "PRAGMA temp_store=FILE")
+	} else {
+		pragmas = append(pragmas, "PRAGMA temp_store=MEMORY")
+	}
+	for _, t := range pragmas {
 		if _, err := db.Exec(t); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("pragmas: %w", err)
+			return fail(fmt.Errorf("pragmas: %w", err))
 		}
 	}
 	for _, stmt := range DDL() {
 		if _, err := db.Exec(stmt); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("schema: %w (%s)", err, stmt)
+			return fail(fmt.Errorf("schema: %w (%s)", err, stmt))
 		}
 	}
 	if err := s.load(); err != nil {
-		db.Close()
-		return nil, err
+		return fail(err)
+	}
+	for _, stmt := range viewDDL {
+		if _, err := db.Exec(stmt); err != nil {
+			return fail(fmt.Errorf("view: %w (%s)", err, stmt))
+		}
 	}
 	if _, err := db.Exec("PRAGMA query_only=ON"); err != nil {
-		db.Close()
-		return nil, err
+		return fail(err)
 	}
 	return s, nil
 }
 
-// Close releases the in-memory database.
-func (s *Store) Close() error { return s.DB.Close() }
+// Close releases the database and removes the temporary file, if any.
+func (s *Store) Close() error {
+	err := s.DB.Close()
+	s.removeFiles()
+	return err
+}
+
+func (s *Store) removeFiles() {
+	if s.path == "" {
+		return
+	}
+	for _, suffix := range []string{"", "-journal", "-wal", "-shm"} {
+		os.Remove(s.path + suffix)
+	}
+}
 
 type loader struct {
 	tx    *sql.Tx
@@ -71,22 +127,32 @@ type loader struct {
 }
 
 func (s *Store) load() error {
+	debug := os.Getenv("DEXSQL_DEBUG_LOAD") != ""
+
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
 	}
 	l := &loader{tx: tx, stmts: map[string]*sql.Stmt{}, s: s}
+	tLoad := time.Now()
 	if err := l.run(); err != nil {
 		tx.Rollback()
 		return err
 	}
+	if debug {
+		fmt.Fprintf(os.Stderr, "load rows: %v\n", time.Since(tLoad))
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	tIdx := time.Now()
 	for _, idx := range indexDDL {
 		if _, err := s.DB.Exec(idx); err != nil {
 			return fmt.Errorf("index: %w", err)
 		}
+	}
+	if debug {
+		fmt.Fprintf(os.Stderr, "indexes: %v\n", time.Since(tIdx))
 	}
 	return nil
 }
@@ -102,6 +168,7 @@ var indexDDL = []string{
 	"CREATE INDEX idx_fields_desc ON fields(descriptor)",
 	"CREATE INDEX idx_method_refs_kind ON method_refs(index_kind, \"index\")",
 	"CREATE INDEX idx_class_methods_method ON class_methods(method_idx)",
+	"CREATE INDEX idx_types_class ON types(file_id, descriptor)",
 }
 
 // ins inserts one row into a catalog table, preparing the statement on first
@@ -126,13 +193,24 @@ func (l *loader) ins(table string, vals ...any) error {
 }
 
 func (l *loader) run() error {
-	for _, step := range []func() error{
+	names := []string{
+		"dexFiles", "strings", "types", "protos", "fields", "methods",
+		"classes", "classMembers", "codeItems", "bytecodeRefs",
+		"annotations", "debugInfo", "layout",
+	}
+	steps := []func() error{
 		l.dexFiles, l.strings, l.types, l.protos, l.fields, l.methods,
 		l.classes, l.classMembers, l.codeItems, l.bytecodeRefs,
 		l.annotations, l.debugInfo, l.layout,
-	} {
+	}
+	debug := os.Getenv("DEXSQL_DEBUG_LOAD") != ""
+	for i, step := range steps {
+		t := time.Now()
 		if err := step(); err != nil {
 			return err
+		}
+		if debug {
+			fmt.Fprintf(os.Stderr, "  %-14s %v\n", names[i], time.Since(t))
 		}
 	}
 	return nil

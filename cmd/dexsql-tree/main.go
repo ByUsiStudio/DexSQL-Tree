@@ -11,111 +11,239 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/api"
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
-	"github.com/dexsql-tree/dexsql-tree/internal/mcp"
-	"github.com/dexsql-tree/dexsql-tree/internal/store"
-	"github.com/dexsql-tree/dexsql-tree/internal/tree"
+	"github.com/byusi-studio/dexsql-tree/internal/api"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/i18n"
+	"github.com/byusi-studio/dexsql-tree/internal/mcp"
+	"github.com/byusi-studio/dexsql-tree/internal/store"
+	"github.com/byusi-studio/dexsql-tree/internal/tree"
 )
 
-type multiFlag []string
+type multiFlag struct {
+	paths []string
+	debug bool
+}
 
-func (m *multiFlag) String() string { return strings.Join(*m, ",") }
+func (m *multiFlag) String() string { return strings.Join(m.paths, ",") }
 func (m *multiFlag) Set(v string) error {
-	*m = append(*m, v)
+	m.paths = append(m.paths, v)
+	return nil
+}
+
+// listFlag collects a repeatable string option.
+type listFlag []string
+
+func (l *listFlag) String() string { return strings.Join(*l, ",") }
+func (l *listFlag) Set(v string) error {
+	*l = append(*l, v)
+	return nil
+}
+
+// kvFlag collects repeatable name=value options for recipes.
+type kvFlag map[string]string
+
+func (k kvFlag) String() string {
+	keys := make([]string, 0, len(k))
+	for key := range k {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, len(keys))
+	for i, key := range keys {
+		parts[i] = key + "=" + k[key]
+	}
+	return strings.Join(parts, ",")
+}
+
+func (k *kvFlag) Set(v string) error {
+	i := strings.IndexByte(v, '=')
+	if i <= 0 {
+		return fmt.Errorf("expected name=value, got %q", v)
+	}
+	if *k == nil {
+		*k = kvFlag{}
+	}
+	(*k)[v[:i]] = v[i+1:]
 	return nil
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	args, err := i18n.ConsumeLangFlag(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if len(args) == 0 {
 		usage()
 		os.Exit(2)
 	}
-	cmd := os.Args[1]
-	args := os.Args[2:]
-	var err error
+	cmd, rest := args[0], args[1:]
 	switch cmd {
 	case "query", "q":
-		err = cmdQuery(args)
-	case "tables":
-		err = cmdTables(args)
+		err = cmdQuery(rest)
+	case "search", "find":
+		err = cmdSearch(rest)
+	case "stats", "info":
+		err = cmdStats(rest)
+	case "recipes":
+		err = cmdRecipes(rest)
+	case "tables", "ls":
+		err = cmdTables(rest)
 	case "tree":
-		err = cmdTree(args)
+		err = cmdTree(rest)
 	case "smali":
-		err = cmdSmali(args)
+		err = cmdSmali(rest)
 	case "serve":
-		err = cmdServe(args)
+		err = cmdServe(rest)
 	case "mcp":
-		err = cmdMCP(args)
+		err = cmdMCP(rest)
+	case "lang", "language", "i18n":
+		err = cmdLang(rest)
 	case "version", "--version", "-v":
 		fmt.Printf("dexsql-tree %s\n", api.Version)
 	case "help", "--help", "-h":
 		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
+		fmt.Fprintln(os.Stderr, i18n.T(fmt.Sprintf("unknown command %q", cmd), fmt.Sprintf("未知命令 %q", cmd)))
+		fmt.Fprintln(os.Stderr)
 		usage()
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		fmt.Fprintln(os.Stderr, i18n.T("error:", "错误:")+" "+err.Error())
 		os.Exit(1)
 	}
 }
 
-func usage() {
-	fmt.Print(`dexsql-tree - SQL and call trees for Android APK/DEX files
+const usageEN = `dexsql-tree - SQL and call trees for Android APK/DEX files
 
 Usage:
-  dexsql-tree query  --input app.apk --sql "SELECT ..." [--limit N] [--format table|json|csv|md]
-  dexsql-tree query  --input app.apk [--interactive]
-  dexsql-tree tables [--json]
-  dexsql-tree tree   --input app.apk --method 'Lcom/x;->y()V' [--direction callers|callees] [--depth N]
-  dexsql-tree smali  --input app.apk --method 'Lcom/x;->y()V'
-  dexsql-tree serve  --input app.apk [--addr 127.0.0.1:8765]
-  dexsql-tree mcp    [--input app.apk]
+  dexsql-tree query   --input app.apk --sql "SELECT ..." [--limit 200] [--format table|json|csv|md]
+  dexsql-tree query   --input app.apk --recipe callers --arg method='Lcom/x;->y()V'
+  dexsql-tree search  --input app.apk --keyword password [--kind class|method|field|string]
+  dexsql-tree stats   --input app.apk [--json] [--top 5]
+  dexsql-tree recipes [name]                    list or explain built-in queries
+  dexsql-tree tables  [--json]                  tables and convenience views
+  dexsql-tree tree    --input app.apk --method 'Lcom/x;->y()V' [--direction callers|callees]
+  dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
+  dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765]
+  dexsql-tree mcp     [--input app.apk]
+  dexsql-tree lang    set zh --write            enable Chinese prompts permanently
 
+Language:
+  DEXSQL_TREE_ZH=true|false  (DEXSQL-TREE_ZH and DEXSQL_TREE_LANG=zh|en also work)
+  --lang zh|en               overrides the environment for one invocation.
+
+Options:
+  --debug  materialise DEX line-number tables (off by default: debug programs
+           can be larger than the code itself)
+  --disk   keep the catalog in a temporary file to reduce memory
 Repeat --input to query several APK/DEX files together.
-`)
+`
+
+const usageZH = `dexsql-tree —— Android APK/DEX 的 SQL 查询与调用树浏览器
+
+用法:
+  dexsql-tree query   --input app.apk --sql "SELECT ..." [--limit 200] [--format table|json|csv|md]
+  dexsql-tree query   --input app.apk --recipe callers --arg method='Lcom/x;->y()V'
+  dexsql-tree search  --input app.apk --keyword 密码 [--kind class|method|field|string]
+  dexsql-tree stats   --input app.apk [--json] [--top 5]
+  dexsql-tree recipes [名称]                   列出或解释内置查询模板
+  dexsql-tree tables  [--json]                 列出数据表与便捷视图
+  dexsql-tree tree    --input app.apk --method 'Lcom/x;->y()V' [--direction callers|callees]
+  dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
+  dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765]
+  dexsql-tree mcp     [--input app.apk]
+  dexsql-tree lang    set zh --write            永久开启中文提示
+
+语言:
+  DEXSQL_TREE_ZH=true|false（也支持 DEXSQL-TREE_ZH 与 DEXSQL_TREE_LANG=zh|en）
+  --lang zh|en              只对本次调用生效。
+
+可选:
+  --debug  物化 DEX 行号表（默认关闭：调试信息可能比代码本身还大）
+  --disk   将目录放在临时文件中，降低内存占用
+重复 --input 可同时查询多个 APK/DEX 文件。
+`
+
+func usage() {
+	if i18n.On() {
+		fmt.Print(usageZH)
+		return
+	}
+	fmt.Print(usageEN)
 }
 
 func (m multiFlag) load() (*dex.Container, error) {
-	if len(m) == 0 {
-		return nil, fmt.Errorf("at least one --input is required")
+	if len(m.paths) == 0 {
+		return nil, fmt.Errorf(i18n.T("at least one --input is required", "至少需要一个 --input 参数"))
 	}
 	var cs []*dex.Container
-	for _, p := range m {
-		c, err := dex.Load(p)
+	for _, p := range m.paths {
+		c, err := dex.Load(p, dex.Options{Debug: m.debug})
 		if err != nil {
 			return nil, err
 		}
 		for _, w := range c.Warnings {
-			fmt.Fprintln(os.Stderr, "warning:", w)
+			fmt.Fprintln(os.Stderr, i18n.T("warning:", "警告:")+" "+w)
 		}
 		cs = append(cs, c)
 	}
 	return dex.Merge(cs), nil
 }
 
+func addInputFlags(fs *flag.FlagSet, inputs *multiFlag) {
+	fs.Var(inputs, "input", i18n.T("APK/DEX input (repeatable)", "APK/DEX 输入文件（可重复）"))
+	fs.BoolVar(&inputs.debug, "debug", false, i18n.T(
+		"materialise DEX line-number tables (large and slow)",
+		"物化 DEX 行号表（体积大、速度慢）"))
+}
+
 func cmdQuery(args []string) error {
 	fs := flag.NewFlagSet("query", flag.ContinueOnError)
 	var inputs multiFlag
-	fs.Var(&inputs, "input", "APK/DEX input (repeatable)")
-	sqlText := fs.String("sql", "", "SQL statement")
-	limit := fs.Int("limit", 0, "maximum rows (0 = all)")
-	format := fs.String("format", "table", "table|json|csv|md")
-	interactive := fs.Bool("interactive", false, "read SQL from stdin")
-	fs.BoolVar(interactive, "repl", false, "alias of --interactive")
-	output := fs.String("output", "", "write result to file")
+	addInputFlags(fs, &inputs)
+	sqlText := fs.String("sql", "", i18n.T("SQL statement", "SQL 语句"))
+	limit := fs.Int("limit", 200, i18n.T("maximum rows (0 = all)", "最大行数（0 表示全部）"))
+	format := fs.String("format", "table", i18n.T("table|json|csv|md", "table|json|csv|md"))
+	interactive := fs.Bool("interactive", false, i18n.T("read SQL from stdin", "从标准输入读取 SQL"))
+	fs.BoolVar(interactive, "repl", false, i18n.T("alias of --interactive", "--interactive 的别名"))
+	output := fs.String("output", "", i18n.T("write result to file", "将结果写入文件"))
+	disk := fs.Bool("disk", false, i18n.T(
+		"use a temporary on-disk catalog to reduce memory", "使用临时文件目录以降低内存占用"))
+	recipe := fs.String("recipe", "", i18n.T("run a built-in recipe (see: dexsql-tree recipes)", "执行内置查询模板（见 dexsql-tree recipes）"))
+	var kv kvFlag
+	fs.Var(&kv, "arg", i18n.T("recipe argument name=value (repeatable)", "模板参数 name=value（可重复）"))
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *recipe != "" {
+		if *sqlText != "" {
+			return fmt.Errorf(i18n.T("use either --recipe or --sql, not both", "--recipe 与 --sql 不能同时使用"))
+		}
+		r, ok := store.FindRecipe(*recipe)
+		if !ok {
+			return fmt.Errorf(i18n.T("unknown recipe %q (run: dexsql-tree recipes)", "未知模板 %q（可运行 dexsql-tree recipes 查看）"), *recipe)
+		}
+		text, err := r.Render(kv)
+		if err != nil {
+			return err
+		}
+		*sqlText = text
 	}
 	c, err := inputs.load()
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(c)
+	st, err := store.Open(c, store.Options{Disk: *disk})
 	if err != nil {
 		return err
 	}
@@ -146,7 +274,7 @@ func cmdQuery(args []string) error {
 			return err
 		}
 		if strings.TrimSpace(string(b)) == "" {
-			return fmt.Errorf("no --sql and empty stdin")
+			return fmt.Errorf(i18n.T("no --sql and empty stdin", "没有 --sql，且标准输入为空"))
 		}
 		return run(string(b))
 	}
@@ -162,13 +290,15 @@ func isTerminal() bool {
 }
 
 func repl(st *store.Store) error {
-	fmt.Println("dexsql-tree interactive session. End statements with ';'. Type .tables, .schema NAME or .quit.")
+	fmt.Println(i18n.T(
+		"dexsql-tree interactive session. End statements with ';'. Type .tables, .schema NAME or .quit.",
+		"dexsql-tree 交互模式。语句以 ';' 结束。可输入 .tables、.schema 表名 或 .quit。"))
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1024*1024), 8*1024*1024)
 	var buf strings.Builder
 	for {
 		if buf.Len() == 0 {
-			fmt.Print("dexsql> ")
+			fmt.Print(i18n.T("dexsql> ", "dexsql> "))
 		} else {
 			fmt.Print("   ...> ")
 		}
@@ -183,16 +313,16 @@ func repl(st *store.Store) error {
 			case trim == ".quit" || trim == ".exit":
 				return nil
 			case trim == ".tables":
-				for _, t := range store.Catalog {
+				for _, t := range store.AllRelations() {
 					fmt.Println(t.Name)
 				}
 				continue
 			case strings.HasPrefix(trim, ".schema"):
 				name := strings.TrimSpace(strings.TrimPrefix(trim, ".schema"))
-				if t, ok := store.CatalogByName[name]; ok {
+				if t, ok := store.Relation(name); ok {
 					fmt.Println(strings.Join(t.Cols, "\n"))
 				} else {
-					fmt.Println("unknown table")
+					fmt.Println(i18n.T("unknown table", "未知数据表"))
 				}
 				continue
 			}
@@ -206,7 +336,7 @@ func repl(st *store.Store) error {
 		buf.Reset()
 		res, err := st.Query(q, 200)
 		if err != nil {
-			fmt.Println("error:", err)
+			fmt.Println(i18n.T("error:", "错误:") + " " + err.Error())
 			continue
 		}
 		text, _ := render(res, "table")
@@ -248,7 +378,7 @@ func render(res *store.Result, format string) (string, error) {
 
 func table(res *store.Result) string {
 	if len(res.Rows) == 0 {
-		return fmt.Sprintf("(0 rows, %d ms)\n", res.ElapsedMS)
+		return fmt.Sprintf(i18n.T("(0 rows, %d ms)\n", "（0 行，%d 毫秒）\n"), res.ElapsedMS)
 	}
 	widths := make([]int, len(res.Columns))
 	for i, c := range res.Columns {
@@ -306,11 +436,11 @@ func table(res *store.Result) string {
 		}
 		writeRow(vals)
 	}
-	fmt.Fprintf(&b, "(%d rows, %d ms", len(res.Rows), res.ElapsedMS)
+	fmt.Fprintf(&b, i18n.T("(%d rows, %d ms", "（%d 行，%d 毫秒"), len(res.Rows), res.ElapsedMS)
 	if res.Truncated {
-		b.WriteString(", truncated")
+		b.WriteString(i18n.T(", truncated", "，已截断"))
 	}
-	b.WriteString(")\n")
+	b.WriteString(i18n.T(")\n", "）\n"))
 	return b.String()
 }
 
@@ -329,7 +459,7 @@ func markdown(res *store.Result) string {
 		}
 		b.WriteString("| " + strings.Join(cells, " | ") + " |\n")
 	}
-	fmt.Fprintf(&b, "\n%d rows, %d ms\n", len(res.Rows), res.ElapsedMS)
+	fmt.Fprintf(&b, "\n"+i18n.T("%d rows, %d ms\n", "%d 行，%d 毫秒\n"), len(res.Rows), res.ElapsedMS)
 	return b.String()
 }
 
@@ -356,19 +486,265 @@ func pad(s string, n int) string {
 	return s + strings.Repeat(" ", n-runeLen(s))
 }
 
-func cmdTables(args []string) error {
-	fs := flag.NewFlagSet("tables", flag.ContinueOnError)
-	asJSON := fs.Bool("json", false, "emit JSON")
+// padDisplay pads to a terminal width, counting CJK runes as two columns so
+// bilingual labels line up.
+func padDisplay(s string, width int) string {
+	w := 0
+	for _, r := range s {
+		if r >= 0x1100 && (r <= 0x115F || (r >= 0x2E80 && r <= 0xA4CF) ||
+			(r >= 0xAC00 && r <= 0xD7A3) || (r >= 0xF900 && r <= 0xFAFF) ||
+			(r >= 0xFE30 && r <= 0xFE6F) || (r >= 0xFF00 && r <= 0xFF60) ||
+			(r >= 0xFFE0 && r <= 0xFFE6)) {
+			w += 2
+		} else {
+			w++
+		}
+	}
+	if w >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-w)
+}
+
+// cmdSearch answers "where is this string or name" without any SQL.
+func cmdSearch(args []string) error {
+	fs := flag.NewFlagSet("search", flag.ContinueOnError)
+	var inputs multiFlag
+	addInputFlags(fs, &inputs)
+	keyword := fs.String("keyword", "", i18n.T("text to search for", "要搜索的文本"))
+	var kinds listFlag
+	fs.Var(&kinds, "kind", i18n.T("class|method|field|string (repeatable, default all)", "class|method|field|string（可重复，默认全部）"))
+	limit := fs.Int("limit", 50, i18n.T("maximum rows", "最大行数"))
+	format := fs.String("format", "table", i18n.T("table|json|csv|md", "table|json|csv|md"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// The keyword may be positional, and flags may follow it:
+	//   search --input app.apk oauth --kind class
+	if rest := fs.Args(); len(rest) > 0 {
+		if *keyword == "" {
+			*keyword = rest[0]
+		}
+		if err := fs.Parse(rest[1:]); err != nil {
+			return err
+		}
+	}
+	kw := *keyword
+	if kw == "" {
+		return fmt.Errorf(i18n.T("--keyword is required", "需要 --keyword 参数"))
+	}
+	c, err := inputs.load()
+	if err != nil {
+		return err
+	}
+	// No SQLite catalog: the scan runs over the parsed model.
+	res, err := store.Search(c, kw, kinds, *limit)
+	if err != nil {
+		return err
+	}
+	text, err := render(res, *format)
+	if err != nil {
+		return err
+	}
+	fmt.Print(text)
+	return nil
+}
+
+// cmdStats prints a one-screen summary straight from the parsed model, so it is
+// fast even for inputs that take a while to materialise into SQLite.
+func cmdStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	var inputs multiFlag
+	addInputFlags(fs, &inputs)
+	asJSON := fs.Bool("json", false, i18n.T("emit JSON", "输出 JSON"))
+	top := fs.Int("top", 5, i18n.T("how many classes to list", "列出多少个类"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	c, err := inputs.load()
+	if err != nil {
+		return err
+	}
+	type classCount struct {
+		Descriptor string `json:"descriptor"`
+		Methods    int    `json:"methods"`
+	}
+	declared, calls := 0, 0
+	perClass := map[string]int{}
+	for _, f := range c.Files {
+		for _, cd := range f.Classes {
+			if cd.ClassData == nil {
+				continue
+			}
+			n := len(cd.ClassData.DirectMethods) + len(cd.ClassData.VirtualMethods)
+			declared += n
+			perClass[cd.Descriptor] += n
+		}
+		for _, ci := range f.CodeItems {
+			for _, ref := range ci.Refs {
+				if ref.Kind == "method" {
+					calls++
+				}
+			}
+		}
+	}
+	topClasses := make([]classCount, 0, len(perClass))
+	for k, v := range perClass {
+		topClasses = append(topClasses, classCount{Descriptor: k, Methods: v})
+	}
+	sort.Slice(topClasses, func(i, j int) bool {
+		if topClasses[i].Methods == topClasses[j].Methods {
+			return topClasses[i].Descriptor < topClasses[j].Descriptor
+		}
+		return topClasses[i].Methods > topClasses[j].Methods
+	})
+	if *top > 0 && len(topClasses) > *top {
+		topClasses = topClasses[:*top]
+	}
 	if *asJSON {
-		b, _ := json.MarshalIndent(store.Catalog, "", "  ")
+		out := map[string]any{
+			"files":      c.Stats().Files,
+			"dexBytes":   c.Stats().DexBytes,
+			"strings":    c.Stats().Strings,
+			"types":      c.Stats().Types,
+			"classes":    c.Stats().Classes,
+			"methods":    c.Stats().Methods,
+			"fields":     c.Stats().Fields,
+			"codeItems":  c.Stats().CodeItems,
+			"declared":   declared,
+			"callSites":  calls,
+			"topClasses": topClasses,
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
 		fmt.Println(string(b))
 		return nil
 	}
-	for _, t := range store.Catalog {
-		fmt.Printf("%-32s %s\n", t.Name, t.Doc)
+	s := c.Stats()
+	row := func(label string, value string) {
+		fmt.Printf("%s %s\n", padDisplay(label, 12), value)
+	}
+	row(i18n.T("files", "文件"), fmt.Sprintf("%d", s.Files))
+	row(i18n.T("dex bytes", "DEX 字节"), humanBytes(s.DexBytes))
+	row(i18n.T("strings", "字符串"), comma(s.Strings))
+	row(i18n.T("types", "类型"), comma(s.Types))
+	row(i18n.T("classes", "类"), comma(s.Classes))
+	row(i18n.T("methods", "方法"), fmt.Sprintf("%s (%s %s)", comma(s.Methods), i18n.T("declared", "其中声明"), comma(declared)))
+	row(i18n.T("fields", "字段"), comma(s.Fields))
+	row(i18n.T("code items", "代码项"), comma(s.CodeItems))
+	row(i18n.T("call sites", "调用指令"), comma(calls))
+	if len(topClasses) > 0 {
+		fmt.Println(i18n.T("largest classes:", "最大的类:"))
+		for i, cc := range topClasses {
+			fmt.Printf("  %d. %-60s %s\n", i+1, cc.Descriptor, comma(cc.Methods))
+		}
+	}
+	return nil
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func comma(n int) string {
+	s := strconv.Itoa(n)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
+}
+
+// cmdRecipes lists the built-in queries, or explains one in detail.
+func cmdRecipes(args []string) error {
+	fs := flag.NewFlagSet("recipes", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, i18n.T("emit JSON", "输出 JSON"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	name := fs.Arg(0)
+	if *asJSON {
+		list := store.Recipes
+		if name != "" {
+			r, ok := store.FindRecipe(name)
+			if !ok {
+				return fmt.Errorf(i18n.T("unknown recipe %q", "未知模板 %q"), name)
+			}
+			list = []store.Recipe{r}
+		}
+		b, _ := json.MarshalIndent(list, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+	if name != "" {
+		r, ok := store.FindRecipe(name)
+		if !ok {
+			return fmt.Errorf(i18n.T("unknown recipe %q (run: dexsql-tree recipes)", "未知模板 %q（可运行 dexsql-tree recipes 查看）"), name)
+		}
+		fmt.Printf("%s - %s\n\n", r.Name, i18n.T(r.Doc, r.DocZH))
+		for _, a := range r.Args {
+			req := ""
+			if a.Required {
+				req = i18n.T(" (required)", "（必填）")
+			}
+			def := ""
+			if a.Default != "" {
+				def = fmt.Sprintf(i18n.T(" default %s", "，默认 %s"), a.Default)
+			}
+			fmt.Printf("  --arg %s=%s  %s%s%s\n", a.Name, a.Name, i18n.T(a.Doc, a.DocZH), req, def)
+		}
+		fmt.Println()
+		fmt.Println(strings.TrimSpace(r.SQL))
+		fmt.Println()
+		fmt.Printf(i18n.T("run: dexsql-tree query --input app.apk --recipe %s", "运行: dexsql-tree query --input app.apk --recipe %s"), r.Name)
+		for _, a := range r.Args {
+			fmt.Printf(" --arg %s=...", a.Name)
+		}
+		fmt.Println()
+		return nil
+	}
+	for _, r := range store.Recipes {
+		fmt.Printf("%-14s %s\n", r.Name, i18n.T(r.Doc, r.DocZH))
+	}
+	return nil
+}
+
+func cmdTables(args []string) error {
+	fs := flag.NewFlagSet("tables", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, i18n.T("emit JSON", "输出 JSON"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rels := store.AllRelations()
+	if *asJSON {
+		b, _ := json.MarshalIndent(rels, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+	for _, t := range rels {
+		suffix := ""
+		if t.Kind == "view" {
+			suffix = i18n.T(" [view]", " [视图]")
+		}
+		fmt.Printf("%-32s %s%s\n", t.Name, t.Doc, suffix)
 	}
 	return nil
 }
@@ -376,17 +752,17 @@ func cmdTables(args []string) error {
 func cmdTree(args []string) error {
 	fs := flag.NewFlagSet("tree", flag.ContinueOnError)
 	var inputs multiFlag
-	fs.Var(&inputs, "input", "APK/DEX input (repeatable)")
-	method := fs.String("method", "", "root method descriptor")
-	direction := fs.String("direction", "callers", "callers|callees")
-	depth := fs.Int("depth", 3, "maximum depth")
-	maxNodes := fs.Int("maxNodes", 5000, "node budget")
-	format := fs.String("format", "text", "text|json|dot")
+	addInputFlags(fs, &inputs)
+	method := fs.String("method", "", i18n.T("root method descriptor", "根方法描述符"))
+	direction := fs.String("direction", "callers", i18n.T("callers|callees", "callers|callees"))
+	depth := fs.Int("depth", 3, i18n.T("maximum depth", "最大深度"))
+	maxNodes := fs.Int("maxNodes", 5000, i18n.T("node budget", "节点上限"))
+	format := fs.String("format", "text", i18n.T("text|json|dot", "text|json|dot"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *method == "" {
-		return fmt.Errorf("--method is required")
+		return fmt.Errorf(i18n.T("--method is required", "需要 --method 参数"))
 	}
 	c, err := inputs.load()
 	if err != nil {
@@ -412,13 +788,13 @@ func cmdTree(args []string) error {
 func cmdSmali(args []string) error {
 	fs := flag.NewFlagSet("smali", flag.ContinueOnError)
 	var inputs multiFlag
-	fs.Var(&inputs, "input", "APK/DEX input (repeatable)")
-	method := fs.String("method", "", "method descriptor")
+	addInputFlags(fs, &inputs)
+	method := fs.String("method", "", i18n.T("method descriptor", "方法描述符"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *method == "" {
-		return fmt.Errorf("--method is required")
+		return fmt.Errorf(i18n.T("--method is required", "需要 --method 参数"))
 	}
 	c, err := inputs.load()
 	if err != nil {
@@ -426,7 +802,7 @@ func cmdSmali(args []string) error {
 	}
 	f, idx, ok := c.FindMethod(*method)
 	if !ok {
-		return fmt.Errorf("method not found: %s", *method)
+		return fmt.Errorf(i18n.T("method not found: %s", "未找到方法: %s"), *method)
 	}
 	text, err := f.Smali(idx)
 	if err != nil {
@@ -439,18 +815,29 @@ func cmdSmali(args []string) error {
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var inputs multiFlag
-	fs.Var(&inputs, "input", "APK/DEX input (repeatable)")
-	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
+	addInputFlags(fs, &inputs)
+	addr := fs.String("addr", "127.0.0.1:8765", i18n.T("listen address", "监听地址"))
+	disk := fs.Bool("disk", false, i18n.T(
+		"use a temporary on-disk catalog to reduce memory", "使用临时文件目录以降低内存占用"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	s := api.New()
-	if len(inputs) > 0 {
+	s.Debug = inputs.debug
+	s.Disk = *disk
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		s.Close()
+		os.Exit(0)
+	}()
+	if len(inputs.paths) > 0 {
 		c, err := inputs.load()
 		if err != nil {
 			return err
 		}
-		st, err := store.Open(c)
+		st, err := store.Open(c, store.Options{Disk: *disk})
 		if err != nil {
 			return err
 		}
@@ -462,15 +849,318 @@ func cmdServe(args []string) error {
 func cmdMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	var inputs multiFlag
-	fs.Var(&inputs, "input", "APK/DEX input (repeatable)")
+	addInputFlags(fs, &inputs)
+	disk := fs.Bool("disk", false, i18n.T(
+		"use a temporary on-disk catalog to reduce memory", "使用临时文件目录以降低内存占用"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	srv := mcp.New(os.Stdout)
-	for _, p := range inputs {
+	srv.Debug = inputs.debug
+	srv.Disk = *disk
+	defer srv.Close()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		srv.Close()
+		os.Exit(0)
+	}()
+	for _, p := range inputs.paths {
 		if _, _, err := srv.Open(p); err != nil {
 			return err
 		}
 	}
 	return srv.Serve(os.Stdin)
+}
+
+// ---------------------------------------------------------------- language
+
+const (
+	blockStart = "# >>> dexsql-tree language >>>"
+	blockEnd   = "# <<< dexsql-tree language <<<"
+)
+
+func cmdLang(args []string) error {
+	fs := flag.NewFlagSet("lang", flag.ContinueOnError)
+	write := fs.Bool("write", false, i18n.T(
+		"append the setting to your shell profile", "把设置写入 shell 启动文件"))
+	file := fs.String("file", "", i18n.T("profile file to edit (default: detected)", "要修改的启动文件（默认自动检测）"))
+	shell := fs.String("shell", "", i18n.T("bash|zsh|fish|powershell|cmd", "bash|zsh|fish|powershell|cmd"))
+	// Pull the action out of the positional list first so that
+	// "lang env --shell fish" and "lang set zh --write" both work: the flag
+	// package stops at the first non-flag argument.
+	action, langValue := "", ""
+	rest := make([]string, 0, len(args))
+	valueFlags := map[string]bool{"--shell": true, "-shell": true, "--file": true, "-file": true}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			if valueFlags[a] && i+1 < len(args) {
+				i++
+				rest = append(rest, args[i])
+			}
+			continue
+		}
+		switch {
+		case action == "":
+			action = a
+		case langValue == "":
+			langValue = a
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if action == "" {
+		action = "show"
+	}
+	sh := detectShell(*shell)
+	path, pathErr := profilePath(sh)
+	switch action {
+	case "show", "status":
+		// On/Source honour --lang as well as the environment.
+		on, src := i18n.On(), i18n.Source()
+		lang := "English"
+		if on {
+			lang = "中文"
+		}
+		row := func(label, value string) {
+			fmt.Printf("%s %s\n", padDisplay(label, 12), value)
+		}
+		row(i18n.T("language:", "当前语言:"), fmt.Sprintf("%s (%s)", lang, i18n.Lang()))
+		row(i18n.T("source:", "来源:"), src)
+		row(i18n.T("enable:", "开启:"), assignment(sh, true))
+		row(i18n.T("disable:", "关闭:"), assignment(sh, false))
+		if pathErr == nil {
+			row(i18n.T("profile:", "启动文件:"), path)
+		}
+		fmt.Println()
+		fmt.Println(i18n.T(
+			"Run 'dexsql-tree lang set zh --write' to make it permanent.",
+			"运行 'dexsql-tree lang set zh --write' 可永久生效。"))
+		return nil
+	case "set", "on", "off", "unset", "clear":
+		on := action == "set" || action == "on"
+		if action == "set" {
+			if langValue == "" {
+				return fmt.Errorf(i18n.T("usage: dexsql-tree lang set zh|en [--write]", "用法: dexsql-tree lang set zh|en [--write]"))
+			}
+			var err error
+			on, err = i18n.ParseFlagValue(langValue)
+			if err != nil {
+				return err
+			}
+		}
+		remove := action == "unset" || action == "clear"
+		if *write {
+			if pathErr != nil {
+				return pathErr
+			}
+			if *file != "" {
+				path = *file
+			}
+			if sh == "cmd" {
+				return fmt.Errorf(i18n.T(
+					"cmd.exe has no profile; run this once: %s",
+					"cmd.exe 没有启动脚本，请手动执行一次: %s"), assignment(sh, on))
+			}
+			if remove {
+				changed, err := writeBlock(path, "", true)
+				if err != nil {
+					return err
+				}
+				if changed {
+					fmt.Printf(i18n.T("removed the dexsql-tree block from %s\n",
+						"已从 %s 移除 dexsql-tree 配置块\n"), path)
+				} else {
+					fmt.Printf(i18n.T("%s has no dexsql-tree block\n", "%s 中没有 dexsql-tree 配置块\n"), path)
+				}
+				return nil
+			}
+			line := assignment(sh, on)
+			changed, err := writeBlock(path, line, false)
+			if err != nil {
+				return err
+			}
+			if changed {
+				fmt.Printf(i18n.T("wrote %s to %s\n", "已写入 %s 到 %s\n"), line, path)
+			} else {
+				fmt.Printf(i18n.T("%s already contains %s\n", "%s 已包含 %s\n"), path, line)
+			}
+			fmt.Println(i18n.T(
+				"Restart the shell or source the file to apply it.",
+				"重新打开终端或 source 该文件后生效。"))
+			return nil
+		}
+		if remove {
+			fmt.Println(unsetLine(sh))
+			return nil
+		}
+		fmt.Println(assignment(sh, on))
+		fmt.Printf(i18n.T("# add --write to persist this in %s\n", "# 加上 --write 可写入 %s\n"), path)
+		return nil
+	case "env":
+		// The assignment that turns Chinese on, ready for eval or copy-paste:
+		//   eval "$(dexsql-tree lang env)"
+		fmt.Println(assignment(sh, true))
+		return nil
+	case "path":
+		if pathErr != nil {
+			return pathErr
+		}
+		fmt.Println(path)
+		return nil
+	case "help", "list":
+		fmt.Println(i18n.T(
+			`usage: dexsql-tree lang [show|set zh|en|unset|env|path] [--write] [--shell NAME] [--file PATH]`,
+			`用法: dexsql-tree lang [show|set zh|en|unset|env|path] [--write] [--shell 名称] [--file 路径]`))
+		return nil
+	default:
+		return fmt.Errorf(i18n.T("unknown action %q", "未知操作 %q"), action)
+	}
+}
+
+// assignment renders the shell-specific line that sets the environment
+// variable, so users can copy it or let --write append it.
+func assignment(shell string, on bool) string {
+	value := "false"
+	if on {
+		value = "true"
+	}
+	switch shell {
+	case "fish":
+		if on {
+			return "set -gx " + i18n.EnvZH + " true"
+		}
+		return "set -e " + i18n.EnvZH
+	case "powershell", "pwsh":
+		return fmt.Sprintf("$env:%s = %q", i18n.EnvZH, value)
+	case "cmd":
+		return "setx " + i18n.EnvZH + " " + value
+	default:
+		return "export " + i18n.EnvZH + "=" + value
+	}
+}
+
+// unsetLine renders the shell-specific command that removes the variable for
+// the current session.
+func unsetLine(shell string) string {
+	switch shell {
+	case "fish":
+		return "set -e " + i18n.EnvZH
+	case "powershell", "pwsh":
+		return "Remove-Item Env:" + i18n.EnvZH + " -ErrorAction SilentlyContinue"
+	case "cmd":
+		return "set " + i18n.EnvZH + "="
+	default:
+		return "unset " + i18n.EnvZH
+	}
+}
+
+func detectShell(explicit string) string {
+	if explicit != "" {
+		return strings.ToLower(explicit)
+	}
+	if sh := filepath.Base(os.Getenv("SHELL")); sh != "" && sh != "." && sh != "/" {
+		return strings.ToLower(sh)
+	}
+	if runtime.GOOS == "windows" {
+		return "powershell"
+	}
+	return "bash"
+}
+
+func profilePath(shell string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	switch shell {
+	case "zsh":
+		return filepath.Join(home, ".zshrc"), nil
+	case "fish":
+		return filepath.Join(home, ".config", "fish", "config.fish"), nil
+	case "bash":
+		if runtime.GOOS == "darwin" {
+			return filepath.Join(home, ".bash_profile"), nil
+		}
+		return filepath.Join(home, ".bashrc"), nil
+	case "powershell", "pwsh":
+		if runtime.GOOS == "windows" {
+			return filepath.Join(home, "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1"), nil
+		}
+		return filepath.Join(home, ".config", "powershell", "Microsoft.PowerShell_profile.ps1"), nil
+	case "cmd":
+		return "", fmt.Errorf("cmd.exe has no profile file")
+	default:
+		return filepath.Join(home, ".profile"), nil
+	}
+}
+
+// writeBlock appends the marked block to path, replacing any previous block.
+func writeBlock(path, line string, remove bool) (bool, error) {
+	mode := os.FileMode(0o644)
+	var old []byte
+	if b, err := os.ReadFile(path); err == nil {
+		old = b
+		if fi, statErr := os.Stat(path); statErr == nil {
+			mode = fi.Mode().Perm()
+		}
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	clean := strings.TrimRight(stripBlock(string(old)), "\n")
+	next := clean
+	if !remove {
+		if next != "" {
+			next += "\n\n"
+		}
+		next += blockStart + "\n" + line + "\n" + blockEnd + "\n"
+	} else if next != "" {
+		next += "\n"
+	}
+	if next == string(old) {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(path, []byte(next), mode); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// stripBlock removes our marker region, keeping every other line untouched.
+func stripBlock(text string) string {
+	if !strings.Contains(text, blockStart) {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	skip := false
+	for _, line := range lines {
+		trim := strings.TrimSpace(line)
+		switch {
+		case trim == blockStart:
+			skip = true
+			continue
+		case trim == blockEnd:
+			skip = false
+			continue
+		}
+		if !skip {
+			out = append(out, line)
+		}
+	}
+	res := strings.Join(out, "\n")
+	// Collapse the blank line that separated the block from the rest.
+	for strings.Contains(res, "\n\n\n") {
+		res = strings.ReplaceAll(res, "\n\n\n", "\n\n")
+	}
+	return res
 }

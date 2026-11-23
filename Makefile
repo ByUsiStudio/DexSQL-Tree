@@ -1,12 +1,24 @@
 BIN := bin/dexsql-tree
+VERSION ?= 0.2.0
+LDFLAGS := -s -w -X github.com/byusi-studio/dexsql-tree/internal/api.Version=$(VERSION)
 
-.PHONY: all build test java demo fmt vet clean
+.PHONY: all build test java demo fmt vet clean release cross
 
 all: build
 
 build:
 	@mkdir -p bin
-	go build -o $(BIN) ./cmd/dexsql-tree
+	go build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/dexsql-tree
+
+# Cross-compile every supported platform (linux/darwin/windows/freebsd,
+# amd64/arm64/armv7) into dist/. Pure-Go engine, so no toolchain per target.
+release:
+	VERSION=$(VERSION) ./scripts/build-all.sh
+
+cross:
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/dexsql-tree
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/dexsql-tree
+	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/dexsql-tree
 
 test:
 	go test ./...
@@ -34,4 +46,4 @@ vet:
 	go vet ./...
 
 clean:
-	rm -rf bin java/target java/*/target
+	rm -rf bin dist java/target java/*/target

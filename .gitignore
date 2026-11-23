@@ -6,3 +6,4 @@ java/*/target/
 .vscode/
 *.log
 .DS_Store
+dist/

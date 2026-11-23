@@ -277,7 +277,7 @@ public final class DexsqlTreeApp extends Application {
     private Region buildStatusBar() {
         busy.setPrefSize(14, 14);
         busy.setVisible(false);
-        Label engine = new Label("engine 0.1.0");
+        Label engine = new Label("engine 0.2.0");
         engine.getStyleClass().add("hint");
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);

@@ -4,7 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
 )
 
 type methodDef struct {

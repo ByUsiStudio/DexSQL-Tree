@@ -10,9 +10,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
-	"github.com/dexsql-tree/dexsql-tree/internal/store"
-	"github.com/dexsql-tree/dexsql-tree/internal/tree"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/i18n"
+	"github.com/byusi-studio/dexsql-tree/internal/store"
+	"github.com/byusi-studio/dexsql-tree/internal/tree"
 )
 
 //go:embed index.html
@@ -21,6 +22,12 @@ var indexHTML []byte
 // Server exposes datasets over HTTP for the Java client and the built-in
 // playground. It is deliberately small: JSON in, JSON out, no auth.
 type Server struct {
+	// Debug materialises DEX line-number tables for datasets opened through the
+	// HTTP API. It is off by default because debug programs can dominate load
+	// time and memory.
+	Debug bool
+	// Disk materialises datasets in a temporary file instead of memory.
+	Disk   bool
 	mu     sync.Mutex
 	stores map[string]*store.Store
 	graphs map[string]*tree.Graph
@@ -30,6 +37,18 @@ type Server struct {
 // New returns an empty server.
 func New() *Server {
 	return &Server{stores: map[string]*store.Store{}, graphs: map[string]*tree.Graph{}}
+}
+
+// Close releases every dataset opened by the server, including temporary
+// on-disk catalogs created with --disk.
+func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.stores {
+		st.Close()
+	}
+	s.stores = map[string]*store.Store{}
+	s.graphs = map[string]*tree.Graph{}
 }
 
 // AddStore registers an already-opened store under id.
@@ -44,11 +63,11 @@ func (s *Server) AddStore(id string, st *store.Store) {
 
 // Add loads a path and registers it.
 func (s *Server) Add(path string) (string, *store.Store, error) {
-	c, err := dex.Load(path)
+	c, err := dex.Load(path, dex.Options{Debug: s.Debug})
 	if err != nil {
 		return "", nil, err
 	}
-	st, err := store.Open(c)
+	st, err := store.Open(c, store.Options{Disk: s.Disk})
 	if err != nil {
 		return "", nil, err
 	}
@@ -72,10 +91,11 @@ func (s *Server) Handler() http.Handler {
 		w.Write(indexHTML)
 	})
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "version": Version})
+		writeJSON(w, 200, map[string]any{"ok": true, "version": Version, "lang": i18n.Lang()})
 	})
 	mux.HandleFunc("/api/datasets", s.handleDatasets)
 	mux.HandleFunc("/api/tables", s.handleTables)
+	mux.HandleFunc("/api/recipes", s.handleRecipes)
 	mux.HandleFunc("/api/table", s.handleTable)
 	mux.HandleFunc("/api/query", s.handleQuery)
 	mux.HandleFunc("/api/tree", s.handleTree)
@@ -84,7 +104,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 // Version is reported by /api/health and the CLI.
-const Version = "0.1.0"
+var Version = "0.2.0"
 
 func cors(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -148,16 +168,32 @@ func (s *Server) handleDatasets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTables(w http.ResponseWriter, r *http.Request) {
-	out := make([]map[string]any, 0, len(store.Catalog))
-	for _, t := range store.Catalog {
-		out = append(out, map[string]any{"name": t.Name, "cols": t.Cols, "doc": t.Doc})
+	rels := store.AllRelations()
+	out := make([]map[string]any, 0, len(rels))
+	for _, t := range rels {
+		out = append(out, map[string]any{"name": t.Name, "kind": t.Kind, "cols": t.Cols, "doc": t.Doc})
 	}
 	writeJSON(w, 200, map[string]any{"tables": out})
 }
 
+// handleRecipes lists the built-in query templates, or explains one by name.
+func (s *Server) handleRecipes(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		writeJSON(w, 200, map[string]any{"recipes": store.Recipes})
+		return
+	}
+	rec, ok := store.FindRecipe(name)
+	if !ok {
+		writeErr(w, 404, fmt.Errorf("unknown recipe %q", name))
+		return
+	}
+	writeJSON(w, 200, rec)
+}
+
 func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
-	t, ok := store.CatalogByName[name]
+	t, ok := store.Relation(name)
 	if !ok {
 		writeErr(w, 404, fmt.Errorf("unknown table %q", name))
 		return
@@ -188,9 +224,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Dataset string `json:"dataset"`
-		SQL     string `json:"sql"`
-		Limit   int    `json:"limit"`
+		Dataset string            `json:"dataset"`
+		SQL     string            `json:"sql"`
+		Recipe  string            `json:"recipe"`
+		Args    map[string]string `json:"args"`
+		Limit   int               `json:"limit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err)
@@ -200,6 +238,23 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 404, err)
 		return
+	}
+	if req.Recipe != "" {
+		if req.SQL != "" {
+			writeErr(w, 400, fmt.Errorf("use either recipe or sql, not both"))
+			return
+		}
+		rec, ok := store.FindRecipe(req.Recipe)
+		if !ok {
+			writeErr(w, 404, fmt.Errorf("unknown recipe %q", req.Recipe))
+			return
+		}
+		sqlText, err := rec.Render(req.Args)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		req.SQL = sqlText
 	}
 	limit := req.Limit
 	if limit <= 0 || limit > maxLimit {

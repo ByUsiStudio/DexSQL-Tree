@@ -22,19 +22,19 @@ type Container struct {
 
 // Load reads a DEX image or every *.dex entry of an APK/ZIP/JAR. Entries are
 // ordered classes.dex, classes2.dex, ... so file_id assignment is stable.
-func Load(path string) (*Container, error) {
+func Load(path string, opts ...Options) (*Container, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return ParseContainer(data, path)
+	return ParseContainer(data, path, opts...)
 }
 
 // ParseContainer decodes an in-memory DEX or ZIP image.
-func ParseContainer(data []byte, path string) (*Container, error) {
+func ParseContainer(data []byte, path string, opts ...Options) (*Container, error) {
 	c := &Container{Path: path}
 	if bytes.HasPrefix(data, []byte("dex\n")) {
-		f, err := Parse(data, path, filepath.Base(path), 0)
+		f, err := Parse(data, path, filepath.Base(path), 0, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +69,7 @@ func ParseContainer(data []byte, path string) (*Container, error) {
 			c.Warnings = append(c.Warnings, fmt.Sprintf("%s: %v", e.Name, err))
 			continue
 		}
-		f, err := Parse(buf, path, e.Name, uint32(len(c.Files)))
+		f, err := Parse(buf, path, e.Name, uint32(len(c.Files)), opts...)
 		if err != nil {
 			c.Warnings = append(c.Warnings, fmt.Sprintf("%s: %v", e.Name, err))
 			continue

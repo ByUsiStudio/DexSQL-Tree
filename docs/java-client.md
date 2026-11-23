@@ -16,8 +16,8 @@ mvn install     # 安装到本地仓库，后续 javafx:run 才能解析 client 
 
 产物：
 
-- `dexsql-tree-client/target/dexsql-tree-client-0.1.0.jar`
-- `dexsql-tree-gui/target/dexsql-tree-gui-0.1.0.jar`
+- `dexsql-tree-client/target/dexsql-tree-client-0.2.0.jar`
+- `dexsql-tree-gui/target/dexsql-tree-gui-0.2.0.jar`
 
 ## 2. 用现成引擎
 

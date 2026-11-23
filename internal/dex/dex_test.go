@@ -4,12 +4,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
-	"github.com/dexsql-tree/dexsql-tree/internal/dextest"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/dextest"
 )
 
 func TestParseHello(t *testing.T) {
-	f, err := dex.Parse(dextest.HelloDex(), "hello.dex", "classes.dex", 0)
+	f, err := dex.Parse(dextest.HelloDex(), "hello.dex", "classes.dex", 0, dex.Options{Debug: true})
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -98,5 +98,27 @@ func TestSmaliOperandOrder(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q in:\n%s", want, text)
 		}
+	}
+}
+
+func TestDebugPositionsAreOptIn(t *testing.T) {
+	// Default: headers are kept, the expensive line program is skipped.
+	f, err := dex.Parse(dextest.HelloDex(), "hello.dex", "classes.dex", 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(f.Positions) != 0 {
+		t.Fatalf("positions parsed without Debug: %d methods", len(f.Positions))
+	}
+	if len(f.DebugInfos) != 1 {
+		t.Fatalf("debug_info headers = %d, want 1", len(f.DebugInfos))
+	}
+
+	g, err := dex.Parse(dextest.HelloDex(), "hello.dex", "classes.dex", 0, dex.Options{Debug: true})
+	if err != nil {
+		t.Fatalf("parse with Debug: %v", err)
+	}
+	if got := len(g.Positions[0]); got != 4 {
+		t.Fatalf("positions = %d, want 4", got)
 	}
 }

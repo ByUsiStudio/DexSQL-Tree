@@ -9,9 +9,9 @@ import (
 	"io"
 	"sync"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
-	"github.com/dexsql-tree/dexsql-tree/internal/store"
-	"github.com/dexsql-tree/dexsql-tree/internal/tree"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/store"
+	"github.com/byusi-studio/dexsql-tree/internal/tree"
 )
 
 type rpcRequest struct {
@@ -35,6 +35,10 @@ type rpcResponse struct {
 
 // Server is a stdio MCP endpoint over one or more datasets.
 type Server struct {
+	// Debug controls line-number materialisation for datasets opened via MCP.
+	Debug bool
+	// Disk materialises datasets in a temporary file instead of memory.
+	Disk    bool
 	mu      sync.Mutex
 	stores  map[string]*store.Store
 	graphs  map[string]*tree.Graph
@@ -48,13 +52,24 @@ func New(out io.Writer) *Server {
 	return &Server{stores: map[string]*store.Store{}, graphs: map[string]*tree.Graph{}, out: out}
 }
 
+// Close releases every dataset opened by the server.
+func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.stores {
+		st.Close()
+	}
+	s.stores = map[string]*store.Store{}
+	s.graphs = map[string]*tree.Graph{}
+}
+
 // Open loads a dataset and returns its id.
 func (s *Server) Open(path string) (string, *store.Store, error) {
-	c, err := dex.Load(path)
+	c, err := dex.Load(path, dex.Options{Debug: s.Debug})
 	if err != nil {
 		return "", nil, err
 	}
-	st, err := store.Open(c)
+	st, err := store.Open(c, store.Options{Disk: s.Disk})
 	if err != nil {
 		return "", nil, err
 	}
@@ -228,6 +243,41 @@ var toolDefs = []map[string]any{
 		},
 	},
 	{
+		"name":        "search",
+		"description": "Search classes, methods, fields and string constants by keyword without writing SQL. Exact and prefix matches rank first.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"keyword": map[string]any{"type": "string", "description": "Text to look for, e.g. password or Lcom/example/."},
+				"kinds": map[string]any{"type": "array", "items": map[string]any{
+					"type": "string", "enum": []string{"class", "method", "field", "string"}},
+					"description": "Restrict the search to these kinds; default all."},
+				"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 5000},
+				"dataset": map[string]any{"type": "string"},
+			},
+			"required": []string{"keyword"},
+		},
+	},
+	{
+		"name":        "run_recipe",
+		"description": "Run a built-in parameterised query (callers, callees, methods-like, strings-like, api-usage, class-info, big-methods, urls). Use list_recipes to see their arguments.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"recipe":  map[string]any{"type": "string", "description": "Recipe name from list_recipes."},
+				"args":    map[string]any{"type": "object", "description": "Placeholder values, e.g. {\"method\": \"Lcom/x;->y()V\"}."},
+				"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 5000},
+				"dataset": map[string]any{"type": "string"},
+			},
+			"required": []string{"recipe"},
+		},
+	},
+	{
+		"name":        "list_recipes",
+		"description": "List the built-in query templates with their arguments.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	},
+	{
 		"name":        "smali",
 		"description": "Disassemble one method to smali text.",
 		"inputSchema": map[string]any{
@@ -264,9 +314,10 @@ func (s *Server) callTool(name string, raw json.RawMessage) (string, error) {
 		s.mu.Unlock()
 		return jsonText(out)
 	case "list_tables":
-		out := make([]map[string]any, 0, len(store.Catalog))
-		for _, t := range store.Catalog {
-			out = append(out, map[string]any{"name": t.Name, "columns": t.Columns(), "doc": t.Doc})
+		rels := store.AllRelations()
+		out := make([]map[string]any, 0, len(rels))
+		for _, t := range rels {
+			out = append(out, map[string]any{"name": t.Name, "kind": t.Kind, "columns": t.Columns(), "doc": t.Doc})
 		}
 		return jsonText(out)
 	case "describe_table":
@@ -276,7 +327,7 @@ func (s *Server) callTool(name string, raw json.RawMessage) (string, error) {
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return "", err
 		}
-		t, ok := store.CatalogByName[a.Name]
+		t, ok := store.Relation(a.Name)
 		if !ok {
 			return "", fmt.Errorf("unknown table %q", a.Name)
 		}
@@ -329,6 +380,58 @@ func (s *Server) callTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		return jsonText(res)
+	case "search":
+		var a struct {
+			Keyword string   `json:"keyword"`
+			Kinds   []string `json:"kinds"`
+			Limit   int      `json:"limit"`
+			Dataset string   `json:"dataset"`
+		}
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return "", err
+		}
+		st, _, err := s.defaultStore(a.Dataset)
+		if err != nil {
+			return "", err
+		}
+		res, err := st.Search(a.Keyword, a.Kinds, a.Limit)
+		if err != nil {
+			return "", err
+		}
+		return jsonText(res)
+	case "run_recipe":
+		var a struct {
+			Recipe  string            `json:"recipe"`
+			Args    map[string]string `json:"args"`
+			Limit   int               `json:"limit"`
+			Dataset string            `json:"dataset"`
+		}
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return "", err
+		}
+		rec, ok := store.FindRecipe(a.Recipe)
+		if !ok {
+			return "", fmt.Errorf("unknown recipe %q (call list_recipes)", a.Recipe)
+		}
+		sqlText, err := rec.Render(a.Args)
+		if err != nil {
+			return "", err
+		}
+		st, _, err := s.defaultStore(a.Dataset)
+		if err != nil {
+			return "", err
+		}
+		limit := a.Limit
+		if limit <= 0 || limit > 5000 {
+			limit = 200
+		}
+		res, err := st.Query(sqlText, limit)
+		if err != nil {
+			return "", err
+		}
+		return jsonText(map[string]any{"recipe": rec.Name, "sql": sqlText, "result": res})
+	case "list_recipes":
+		return jsonText(store.Recipes)
 	case "smali":
 		var a struct {
 			Method  string `json:"method"`

@@ -1,7 +1,7 @@
 package store
 
 import (
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
 )
 
 func (l *loader) layout() error {

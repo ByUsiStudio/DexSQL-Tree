@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
-	"github.com/dexsql-tree/dexsql-tree/internal/dextest"
-	"github.com/dexsql-tree/dexsql-tree/internal/tree"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/dextest"
+	"github.com/byusi-studio/dexsql-tree/internal/tree"
 )
 
 func graph(t *testing.T) *tree.Graph {

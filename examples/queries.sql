@@ -1,7 +1,17 @@
 -- dexsql-tree 示例查询
 -- 用法：
 --   ./bin/dexsql-tree query --input app.apk --sql "$(sed -n '5,12p' examples/queries.sql)"
+--   ./bin/dexsql-tree query --input app.apk --recipe callers --arg method='Lcom/x;->y()V'
+--   ./bin/dexsql-tree search --input app.apk --keyword password
 -- 或在交互会话中逐条粘贴。
+
+-- 0. 先看规模（视图；也可以直接用 dexsql-tree stats）
+SELECT * FROM v_overview;
+
+-- 0b. 方法已带 Java 类名与访问标志，不用自己 JOIN types
+SELECT java_class, name, opcode_count
+FROM v_methods
+WHERE is_public AND name LIKE '%onCreate%';
 
 -- 1. 概览：每个 DEX 的类/方法数量
 SELECT file_id, entry_name, class_count, method_count, string_count

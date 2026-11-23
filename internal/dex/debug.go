@@ -4,7 +4,7 @@ import "fmt"
 
 // parseDebugFor decodes the debug_info_item attached to a code item, running
 // the DEX line/position state machine to produce positions and local events.
-func (f *File) parseDebugFor(ci *CodeItem) {
+func (f *File) parseDebugFor(ci *CodeItem, withPositions bool) {
 	off := ci.DebugInfoOff
 	if off == 0 || int(off) >= len(f.raw) {
 		return
@@ -24,6 +24,12 @@ func (f *File) parseDebugFor(ci *CodeItem) {
 	}
 	f.DebugInfos[ci.MethodIdx] = di
 	f.DebugParams[ci.MethodIdx] = di.ParamNameIdx
+
+	// The line/local program is the expensive part; callers opt in with
+	// --debug because it often dwarfs the code itself.
+	if !withPositions {
+		return
+	}
 
 	addr := uint32(0)
 	line := int32(lineStart)

@@ -13,11 +13,13 @@
   │                                        → 注解目录 / encoded_value
   │                                        → debug_info 状态机
   │
-  ├─ store.Open                           建 55 张表 → 单事务批量插入 → 建索引 → query_only=ON
+  ├─ store.Open                           建 55 张表 → 单事务批量插入 → 建索引 → 建 3 个视图 → query_only=ON
   │
   ├─ tree.BuildGraph                      按方法描述符聚合调用边（含调用点计数）
   │
-  └─ 出口：CLI / HTTP / MCP
+  ├─ store.Search / stats                   直接扫描模型（不物化），毫秒级定位字符串与符号
+  │
+  └─ 出口：CLI / HTTP / MCP（共享同一套查询模板与中英文案）
 ```
 
 解析是**急切**的：`dex.Parse` 返回后，所有节都已解码为 Go 结构；`store.Open` 再把它们摊平成行。这样做的代价是打开慢、内存高，收益是查询路径没有任何隐式 I/O，行为可复现。

@@ -8,7 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/dexsql-tree/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/dex"
+	"github.com/byusi-studio/dexsql-tree/internal/i18n"
 )
 
 // Edge is one aggregated caller -> callee relationship.
@@ -228,11 +229,13 @@ func nameOf(desc string) string {
 // Text renders the tree as an indented list.
 func (r *Result) Text() string {
 	var b strings.Builder
-	direction := "callers of"
+	direction := i18n.T("callers of", "以下方法的调用者:")
 	if r.Direction == "callees" {
-		direction = "callees of"
+		direction = i18n.T("callees of", "以下方法调用了:")
 	}
-	fmt.Fprintf(&b, "%s %s (depth %d, %d nodes)\n", direction, r.Root.Descriptor, r.MaxDepth, r.NodeCount)
+	fmt.Fprintf(&b, "%s %s %s\n", direction, r.Root.Descriptor,
+		i18n.T(fmt.Sprintf("(depth %d, %d nodes)", r.MaxDepth, r.NodeCount),
+			fmt.Sprintf("（深度 %d，%d 个节点）", r.MaxDepth, r.NodeCount)))
 	var rec func(n *Node, prefix string, last bool, root bool)
 	rec = func(n *Node, prefix string, last bool, root bool) {
 		if root {
@@ -249,7 +252,7 @@ func (r *Result) Text() string {
 				suffix = fmt.Sprintf("  (x%d)", n.Calls)
 			}
 			if n.Cycle {
-				suffix += "  [cycle]"
+				suffix += i18n.T("  [cycle]", "  [循环]")
 			}
 			fmt.Fprintf(&b, "%s%s%s%s\n", prefix, branch, n.Descriptor, suffix)
 			prefix = next
@@ -260,7 +263,7 @@ func (r *Result) Text() string {
 	}
 	rec(r.Root, "", true, true)
 	if r.Truncated {
-		b.WriteString("... truncated\n")
+		b.WriteString(i18n.T("... truncated\n", "…… 已截断\n"))
 	}
 	return b.String()
 }

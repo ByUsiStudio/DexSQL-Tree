@@ -11,7 +11,19 @@ import (
 // Parse decodes a single DEX image. sourcePath/entryName are carried into the
 // output for provenance; fileID is assigned by the caller when several DEX
 // files are loaded together.
-func Parse(data []byte, sourcePath, entryName string, fileID uint32) (*File, error) {
+// Options controls optional, potentially expensive parts of decoding.
+type Options struct {
+	// Debug materialises the line-number and local-variable tables. DEX debug
+	// programs are often several times larger than the code itself, so this is
+	// off by default.
+	Debug bool
+}
+
+func Parse(data []byte, sourcePath, entryName string, fileID uint32, opts ...Options) (*File, error) {
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	if len(data) < 112 {
 		return nil, fmt.Errorf("dex: file too small (%d bytes)", len(data))
 	}
@@ -21,17 +33,18 @@ func Parse(data []byte, sourcePath, entryName string, fileID uint32) (*File, err
 	version := string(data[4:7])
 
 	f := &File{
-		raw:         data,
-		FileID:      fileID,
-		SourcePath:  sourcePath,
-		EntryName:   entryName,
-		ByteLen:     int64(len(data)),
-		Version:     version,
-		CodeItems:   map[uint32]*CodeItem{},
-		DebugInfos:  map[uint32]*DebugInfo{},
-		DebugParams: map[uint32][]uint32{},
-		Positions:   map[uint32][]Position{},
-		Locals:      map[uint32][]Local{},
+		raw:            data,
+		debugPositions: opt.Debug,
+		FileID:         fileID,
+		SourcePath:     sourcePath,
+		EntryName:      entryName,
+		ByteLen:        int64(len(data)),
+		Version:        version,
+		CodeItems:      map[uint32]*CodeItem{},
+		DebugInfos:     map[uint32]*DebugInfo{},
+		DebugParams:    map[uint32][]uint32{},
+		Positions:      map[uint32][]Position{},
+		Locals:         map[uint32][]Local{},
 	}
 
 	r := &errReader{b: data}
@@ -418,7 +431,7 @@ func (f *File) sortClassData() {
 				continue
 			}
 			f.CodeItems[m.MethodIdx] = ci
-			f.parseDebugFor(ci)
+			f.parseDebugFor(ci, f.debugPositions)
 		}
 	}
 }

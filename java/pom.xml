@@ -6,12 +6,12 @@
 
   <groupId>org.dexsqltree</groupId>
   <artifactId>dexsql-tree-java</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <packaging>pom</packaging>
 
   <name>dexsql-tree Java client</name>
   <description>Java client and JavaFX desktop UI for the dexsql-tree engine</description>
-  <url>https://github.com/dexsql-tree/dexsql-tree</url>
+  <url>https://github.com/byusi-studio/dexsql-tree</url>
 
   <licenses>
     <license>

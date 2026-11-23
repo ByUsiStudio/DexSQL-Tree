@@ -1,4 +1,4 @@
-module github.com/dexsql-tree/dexsql-tree
+module github.com/byusi-studio/dexsql-tree
 
 go 1.21
 
