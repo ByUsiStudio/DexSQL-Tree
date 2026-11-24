@@ -131,7 +131,7 @@ func Search(c *dex.Container, keyword string, kinds []string, limit int) (*Resul
 	})
 	// Multi-dex inputs can repeat a descriptor; keep the first occurrence.
 	seen := make(map[string]bool, len(hits))
-	res := &Result{Columns: []string{"kind", "name", "owner", "detail"}}
+	res := &Result{Columns: []string{"kind", "name", "owner", "detail"}, Rows: [][]any{}}
 	truncated := false
 	for _, h := range hits {
 		key := h.kind + "\x00" + h.name

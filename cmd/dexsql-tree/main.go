@@ -141,7 +141,7 @@ Usage:
   dexsql-tree tables  [--json]                  tables and convenience views
   dexsql-tree tree    --input app.apk --method 'Lcom/x;->y()V' [--direction callers|callees]
   dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
-  dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765]
+  dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765] [--token SECRET]
   dexsql-tree mcp     [--input app.apk]
   dexsql-tree cache   list|clear|path|info      manage the persisted catalog cache
   dexsql-tree lang    set zh --write            enable Chinese prompts permanently
@@ -159,6 +159,10 @@ Options:
   --debug  materialise DEX line-number tables (off by default: debug programs
            can be larger than the code itself)
   --disk   keep the catalog in a temporary file to reduce memory
+  --all-tables
+           materialise every table instead of only the ones the SQL reads
+  --token SECRET (serve)
+           require the bearer token on /api routes
 Repeat --input to query several APK/DEX files together.
 `
 
@@ -173,7 +177,7 @@ const usageZH = `dexsql-tree —— Android APK/DEX 的 SQL 查询与调用树�
   dexsql-tree tables  [--json]                 列出数据表与便捷视图
   dexsql-tree tree    --input app.apk --method 'Lcom/x;->y()V' [--direction callers|callees]
   dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
-  dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765]
+  dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765] [--token SECRET]
   dexsql-tree mcp     [--input app.apk]
   dexsql-tree cache   list|clear|path|info      管理磁盘目录缓存
   dexsql-tree lang    set zh --write            永久开启中文提示
@@ -190,6 +194,10 @@ const usageZH = `dexsql-tree —— Android APK/DEX 的 SQL 查询与调用树�
   --jobs N 并行解析 N 个 DEX（默认等于 CPU 核数）
   --debug  物化 DEX 行号表（默认关闭：调试信息可能比代码本身还大）
   --disk   将目录放在临时文件中，降低内存占用
+  --all-tables
+           物化全部表，而不是只物化 SQL 用到的表
+  --token SECRET（serve）
+           要求 /api 路由携带该 token
 重复 --input 可同时查询多个 APK/DEX 文件。
 `
 
@@ -279,6 +287,9 @@ func cmdQuery(args []string) error {
 	disk := fs.Bool("disk", false, i18n.T(
 		"use a temporary on-disk catalog to reduce memory", "使用临时文件目录以降低内存占用"))
 	recipe := fs.String("recipe", "", i18n.T("run a built-in recipe (see: dexsql-tree recipes)", "执行内置查询模板（见 dexsql-tree recipes）"))
+	allTables := fs.Bool("all-tables", false, i18n.T(
+		"materialise every table instead of only the ones the SQL reads",
+		"物化全部表，而不是只物化 SQL 用到的表"))
 	var kv kvFlag
 	fs.Var(&kv, "arg", i18n.T("recipe argument name=value (repeatable)", "模板参数 name=value（可重复）"))
 	if err := fs.Parse(args); err != nil {
@@ -298,6 +309,38 @@ func cmdQuery(args []string) error {
 		}
 		*sqlText = text
 	}
+	// The statement is known before the container is, which is what lets the
+	// catalog be built for the few tables this query reads. Interactive mode is
+	// the exception: the next statement can name anything, so it builds all.
+	statement := *sqlText
+	if statement == "" && !*interactive && !isTerminal() {
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		statement = string(b)
+		if strings.TrimSpace(statement) == "" {
+			return fmt.Errorf(i18n.T("no --sql and empty stdin", "没有 --sql，且标准输入为空"))
+		}
+	}
+	var tables []string
+	switch {
+	case *allTables:
+		tables = store.AllTables()
+		tracef("plan: every table (%d)", len(tables))
+	case strings.TrimSpace(statement) != "":
+		planned, resolved := store.TablesForSQL(statement)
+		tables = planned
+		if resolved {
+			tracef("plan: %d table(s): %s", len(planned), strings.Join(planned, ", "))
+		} else {
+			tracef("plan: this statement reads no catalog table")
+		}
+	default:
+		// Interactive: the next statement can name anything, including the
+		// derived tables the fast profile leaves out by default.
+		tables = store.AllTables()
+	}
 	c, err := inputs.load()
 	if err != nil {
 		return err
@@ -306,13 +349,25 @@ func cmdQuery(args []string) error {
 	if err != nil {
 		return err
 	}
+	if tables != nil {
+		opt.Tables = tables
+	}
 	st, err := store.Open(c, opt)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	if opt.CacheDir != "" {
-		tracef("catalog: %s (profile %s, %d methods)", map[bool]string{true: "cache hit", false: "materialised"}[st.Cached], st.Profile, st.Stats.Methods)
+		tracef("catalog: %s (profile %s, %d methods, %d tables)",
+			map[bool]string{true: "cache hit", false: "materialised"}[st.Cached],
+			st.Profile, st.Stats.Methods, len(st.Tables()))
+	}
+	// A SQL-only process never touches the parsed model again; dropping it
+	// before the query keeps the peak resident set near the catalog size.
+	if st.Container != nil {
+		st.ReleaseModel()
+		c = nil
+		runtime.GC()
 	}
 
 	run := func(q string) error {
@@ -334,15 +389,7 @@ func cmdQuery(args []string) error {
 		return run(*sqlText)
 	}
 	if !*interactive && !isTerminal() {
-		// Batch mode: the whole stdin is one statement.
-		b, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(string(b)) == "" {
-			return fmt.Errorf(i18n.T("no --sql and empty stdin", "没有 --sql，且标准输入为空"))
-		}
-		return run(string(b))
+		return run(statement)
 	}
 	return repl(st)
 }
@@ -353,6 +400,19 @@ func isTerminal() bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// loopbackAddr reports whether an address only accepts local connections.
+func loopbackAddr(addr string) bool {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || host == "localhost" || host == "::1" || host == "0:0:0:0:0:0:0:1" {
+		return true
+	}
+	return strings.HasPrefix(host, "127.")
 }
 
 func repl(st *store.Store) error {
@@ -883,14 +943,23 @@ func cmdServe(args []string) error {
 	var inputs multiFlag
 	addInputFlags(fs, &inputs)
 	addr := fs.String("addr", "127.0.0.1:8765", i18n.T("listen address", "监听地址"))
+	token := fs.String("token", "", i18n.T(
+		"require this bearer token on /api routes", "要求 /api 路由携带此 token"))
 	disk := fs.Bool("disk", false, i18n.T(
 		"use a temporary on-disk catalog to reduce memory", "使用临时文件目录以降低内存占用"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *token == "" && !loopbackAddr(*addr) {
+		fmt.Fprintln(os.Stderr, i18n.T(
+			"warning: listening on a non-loopback address without --token; anyone who can reach the port can query the loaded APKs",
+			"警告: 正在监听非本机地址但没有 --token；能访问该端口的人都可以查询已加载的 APK"))
+	}
 	s := api.New()
 	s.Debug = inputs.debug
 	s.Disk = *disk
+	s.Lazy = true
+	s.Token = *token
 	profile, err := store.ParseProfile(inputs.profile)
 	if err != nil {
 		return err
@@ -916,6 +985,9 @@ func cmdServe(args []string) error {
 		if err != nil {
 			return err
 		}
+		// The first dataset is opened before any request arrives, so it has the
+		// same lazy deal as the ones added over the API.
+		opt.Lazy = s.Lazy
 		st, err := store.Open(c, opt)
 		if err != nil {
 			return err
@@ -1312,16 +1384,39 @@ func cmdCache(args []string) error {
 			return err
 		}
 		key := cache.Key(inputs.paths, string(profile), api.Version, inputs.debug)
-		e, ok := cache.Stat(dir, key)
-		if !ok {
+		ents, err := cache.ForInput(dir, key)
+		if err != nil {
+			return err
+		}
+		if len(ents) == 0 {
 			fmt.Printf(i18n.T("no catalog for this input (key %s); run a query with --cache to build it\n",
 				"该输入还没有目录（键 %s）；带 --cache 运行一次查询即可生成\n"), key)
 			return nil
 		}
-		fmt.Printf("%s %s\n", padDisplay(i18n.T("key:", "键:"), 12), e.Key)
-		fmt.Printf("%s %s\n", padDisplay(i18n.T("path:", "路径:"), 12), e.Path)
-		fmt.Printf("%s %s\n", padDisplay(i18n.T("size:", "大小:"), 12), humanBytes(e.Size))
-		fmt.Printf("%s %s\n", padDisplay(i18n.T("built:", "生成于:"), 12), e.ModTime.Format("2006-01-02 15:04:05"))
+		var total int64
+		newest := ents[0].ModTime
+		full := false
+		for _, e := range ents {
+			total += e.Size
+			if e.ModTime.After(newest) {
+				newest = e.ModTime
+			}
+			if e.Key == key {
+				full = true
+			}
+		}
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("key:", "键:"), 12), key)
+		if len(ents) == 1 && full {
+			fmt.Printf("%s %s\n", padDisplay(i18n.T("path:", "路径:"), 12), ents[0].Path)
+		} else {
+			kind := i18n.T("on demand", "按需")
+			if full {
+				kind = i18n.T("full + on demand", "完整 + 按需")
+			}
+			fmt.Printf("%s %d (%s)\n", padDisplay(i18n.T("catalogs:", "目录数:"), 12), len(ents), kind)
+		}
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("size:", "大小:"), 12), humanBytes(total))
+		fmt.Printf("%s %s\n", padDisplay(i18n.T("built:", "生成于:"), 12), newest.Format("2006-01-02 15:04:05"))
 		fmt.Printf("%s %s\n", padDisplay(i18n.T("profile:", "档位:"), 12), profile)
 	default:
 		return fmt.Errorf(i18n.T("unknown cache action %q (list|clear|path|info)", "未知的 cache 操作 %q（list|clear|path|info）"), action)

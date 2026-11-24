@@ -56,6 +56,17 @@ func boolInt(b bool) int {
 }
 
 func (l *loader) bytecodeRefs() error {
+	refs := l.batch("method_refs")
+	calls := l.batch("method_calls")
+	strs := l.batch("method_strings")
+	fields := l.batch("method_field_accesses")
+	usedTypes := l.batch("method_used_types")
+	numbers := l.batch("method_numbers")
+	usingNumbers := l.batch("method_using_numbers")
+	if refs == nil && calls == nil && strs == nil && fields == nil &&
+		usedTypes == nil && numbers == nil && usingNumbers == nil {
+		return nil
+	}
 	for _, f := range l.s.Container.Files {
 		for mi := range f.Methods {
 			m := f.Methods[mi]
@@ -64,25 +75,35 @@ func (l *loader) bytecodeRefs() error {
 				continue
 			}
 			for _, ref := range ci.Refs {
-				var using any
-				if ref.UsingType != "" {
-					using = ref.UsingType
-				}
-				if err := l.ins("method_refs", int64(f.FileID), int64(m.ClassIdx), int64(mi),
-					ref.Kind, int64(ref.Index), using, int64(ref.Addr)); err != nil {
-					return err
+				if refs != nil {
+					var using any
+					if ref.UsingType != "" {
+						using = ref.UsingType
+					}
+					refs.rows = append(refs.rows, int64(f.FileID), int64(m.ClassIdx), int64(mi),
+						ref.Kind, int64(ref.Index), using, int64(ref.Addr))
+					if err := l.done(refs); err != nil {
+						return err
+					}
 				}
 				switch ref.Kind {
 				case "string":
+					if strs == nil {
+						continue
+					}
 					val := ""
 					if int(ref.Index) < len(f.Strings) {
 						val = f.Strings[ref.Index]
 					}
-					if err := l.ins("method_strings", m.Descriptor, m.ClassDesc, m.Name, val,
-						int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index)); err != nil {
+					strs.rows = append(strs.rows, m.Descriptor, m.ClassDesc, m.Name, val,
+						int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index))
+					if err := l.done(strs); err != nil {
 						return err
 					}
 				case "method":
+					if calls == nil {
+						continue
+					}
 					callee, calleeClass, calleeName := "", "", ""
 					if int(ref.Index) < len(f.Methods) {
 						cm := f.Methods[ref.Index]
@@ -90,42 +111,67 @@ func (l *loader) bytecodeRefs() error {
 					} else {
 						l.s.Warnings = append(l.s.Warnings, "method_calls: callee index out of range")
 					}
-					if err := l.ins("method_calls", m.Descriptor, m.ClassDesc, m.Name, callee,
-						calleeClass, calleeName, int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index)); err != nil {
+					calls.rows = append(calls.rows, m.Descriptor, m.ClassDesc, m.Name, callee,
+						calleeClass, calleeName, int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index))
+					if err := l.done(calls); err != nil {
 						return err
 					}
 				case "field":
+					if fields == nil {
+						continue
+					}
+					var using any
+					if ref.UsingType != "" {
+						using = ref.UsingType
+					}
 					fld, fldClass, fldName, fldType := "", "", "", ""
 					if int(ref.Index) < len(f.Fields) {
 						fd := f.Fields[ref.Index]
 						fld, fldClass, fldName, fldType = fd.Descriptor(), fd.ClassDesc, fd.Name, fd.TypeDesc
 					}
-					if err := l.ins("method_field_accesses", m.Descriptor, m.ClassDesc, m.Name, fld,
-						fldClass, fldName, fldType, using, int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index)); err != nil {
+					fields.rows = append(fields.rows, m.Descriptor, m.ClassDesc, m.Name, fld,
+						fldClass, fldName, fldType, using, int64(f.FileID), int64(m.ClassIdx),
+						int64(mi), int64(ref.Index))
+					if err := l.done(fields); err != nil {
 						return err
 					}
 				case "type":
+					if usedTypes == nil {
+						continue
+					}
 					desc := ""
 					if int(ref.Index) < len(f.TypeDescs) {
 						desc = f.TypeDescs[ref.Index]
 					}
-					if err := l.ins("method_used_types", m.Descriptor, m.ClassDesc, m.Name, desc,
-						dex.JavaName(desc), int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index)); err != nil {
+					usedTypes.rows = append(usedTypes.rows, m.Descriptor, m.ClassDesc, m.Name, desc,
+						dex.JavaName(desc), int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index))
+					if err := l.done(usedTypes); err != nil {
 						return err
 					}
 				}
 			}
 			for _, n := range ci.Numbers {
+				if numbers != nil {
+					var dbl any
+					if n.HasDouble {
+						dbl = n.DoubleVal
+					}
+					numbers.rows = append(numbers.rows, int64(f.FileID), int64(m.ClassIdx), int64(mi),
+						int64(n.Opcode), n.NumberType, n.LongValue, dbl)
+					if err := l.done(numbers); err != nil {
+						return err
+					}
+				}
+				if usingNumbers == nil {
+					continue
+				}
 				var dbl any
 				if n.HasDouble {
 					dbl = n.DoubleVal
 				}
-				if err := l.ins("method_numbers", int64(f.FileID), int64(m.ClassIdx), int64(mi),
-					int64(n.Opcode), n.NumberType, n.LongValue, dbl); err != nil {
-					return err
-				}
-				if err := l.ins("method_using_numbers", m.Descriptor, m.ClassDesc, m.Name, n.NumberType,
-					n.LongValue, dbl, int64(n.Opcode), int64(f.FileID), int64(m.ClassIdx), int64(mi)); err != nil {
+				usingNumbers.rows = append(usingNumbers.rows, m.Descriptor, m.ClassDesc, m.Name, n.NumberType,
+					n.LongValue, dbl, int64(n.Opcode), int64(f.FileID), int64(m.ClassIdx), int64(mi))
+				if err := l.done(usingNumbers); err != nil {
 					return err
 				}
 			}

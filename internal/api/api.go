@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -35,10 +36,19 @@ type Server struct {
 	Cache bool
 	// CacheDir overrides the cache location; empty means the user cache dir.
 	CacheDir string
-	mu       sync.Mutex
-	stores   map[string]*store.Store
-	graphs   map[string]*tree.Graph
-	nextID   int
+	// Lazy materialises tables when a query first reads them, instead of
+	// building the whole catalog at open time. A server sees statements after
+	// it has opened the dataset, so this is the difference between paying for
+	// 56 tables on connect and paying for the two a request touches.
+	Lazy bool
+	// Token, when set, requires "Authorization: Bearer <token>" or ?token= on
+	// every /api route. The playground page itself stays public so a browser
+	// can load it and pass the token through the URL.
+	Token  string
+	mu     sync.Mutex
+	stores map[string]*store.Store
+	graphs map[string]*tree.Graph
+	nextID int
 }
 
 // New returns an empty server.
@@ -83,7 +93,7 @@ func (s *Server) AddJobs(path string, jobs int) (string, *store.Store, error) {
 	if profile == "" {
 		profile = store.ProfileFast
 	}
-	opt := store.Options{Disk: s.Disk, Profile: profile}
+	opt := store.Options{Disk: s.Disk, Profile: profile, Lazy: s.Lazy}
 	if s.Cache {
 		dir := s.CacheDir
 		if dir == "" {
@@ -130,11 +140,35 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/smali", s.handleSmali)
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/cache", s.handleCache)
-	return cors(mux)
+	return cors(s.requireToken(mux))
+}
+
+// requireToken guards the JSON API when a token is configured. The static
+// playground page is served without it; the page forwards ?token= to its own
+// requests, so a browser session works by opening /?token=... once.
+func (s *Server) requireToken(h http.Handler) http.Handler {
+	if s.Token == "" {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			h.ServeHTTP(w, r)
+			return
+		}
+		tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if tok == "" {
+			tok = r.URL.Query().Get("token")
+		}
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(s.Token)) != 1 {
+			writeJSON(w, 401, map[string]string{"error": "unauthorized: pass Authorization: Bearer <token> or ?token="})
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // Version is reported by /api/health and the CLI.
-var Version = "0.3.0"
+var Version = "0.4.0"
 
 func cors(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -186,6 +186,9 @@ func (f *File) parseEncodedArray(data []byte, off uint32) ([]EncodedValue, []Ann
 	}
 	pos := int(off)
 	n := int(readULEBAt(data, &pos))
+	if n < 0 || !fits(uint32(pos), uint32(n), 1, len(data)) {
+		return nil, nil, off, fmt.Errorf("encoded_array size %d exceeds the remaining bytes", n)
+	}
 	vals := make([]EncodedValue, 0, n)
 	var all []AnnotationElement
 	for i := 0; i < n; i++ {

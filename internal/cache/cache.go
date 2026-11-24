@@ -70,6 +70,44 @@ func Path(dir, key string) string {
 	return filepath.Join(dir, key+".db")
 }
 
+// Subkey folds the table set of an on-demand build into a catalog key.
+//
+// A catalog built for two tables cannot answer a statement that reads five, so
+// the set is part of the cache identity. Sorting keeps "--sql a" and "--sql b"
+// that read the same tables on one catalog. An empty set returns the base key,
+// because a statement that reads no relation has nothing to cache.
+func Subkey(base string, tables []string) string {
+	if len(tables) == 0 {
+		return base
+	}
+	sorted := append([]string(nil), tables...)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, ",")))
+	// Keep a prefix of the base key so `cache list` groups one input's
+	// catalogs together and `cache info` can find them again.
+	prefix := base
+	if len(prefix) > 12 {
+		prefix = prefix[:12]
+	}
+	return prefix + "-" + hex.EncodeToString(sum[:])[:8]
+}
+
+// ForInput returns the catalogs belonging to one input: the full catalog plus
+// every on-demand subset built for it.
+func ForInput(dir, base string) ([]Entry, error) {
+	ents, err := List(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Entry, 0, 2)
+	for _, e := range ents {
+		if e.Key == base || strings.HasPrefix(e.Key, base[:min(len(base), 12)]+"-") {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // Stat reports whether a catalog exists for key.
 func Stat(dir, key string) (Entry, bool) {
 	p := Path(dir, key)

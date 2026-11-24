@@ -82,7 +82,7 @@ func (s *Server) Open(path string) (string, *store.Store, error) {
 	if profile == "" {
 		profile = store.ProfileFast
 	}
-	opt := store.Options{Disk: s.Disk, Profile: profile}
+	opt := store.Options{Disk: s.Disk, Profile: profile, Lazy: true}
 	if s.Cache {
 		dir := s.CacheDir
 		if dir == "" {

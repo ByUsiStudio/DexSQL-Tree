@@ -54,6 +54,7 @@ public final class DexsqlClient {
     // to read the Instant timestamps in CacheInfo.
     private final ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
     private final Duration requestTimeout;
+    private final String token;
     private volatile String datasetId;
 
     /** Shared worker pool used by the async methods and by GUI tasks. */
@@ -69,10 +70,20 @@ public final class DexsqlClient {
         this(baseUrl, Duration.ofMinutes(5));
     }
 
+    public DexsqlClient(String baseUrl, String token) {
+        this(baseUrl, Duration.ofMinutes(5), token);
+    }
+
     public DexsqlClient(String baseUrl, Duration requestTimeout) {
+        this(baseUrl, requestTimeout, null);
+    }
+
+    /** A client that sends {@code Authorization: Bearer <token>} on every call. */
+    public DexsqlClient(String baseUrl, Duration requestTimeout, String token) {
         String url = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         this.base = URI.create(url);
         this.requestTimeout = requestTimeout;
+        this.token = token == null || token.isBlank() ? null : token;
         this.http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .followRedirects(HttpClient.Redirect.NORMAL)
@@ -208,11 +219,7 @@ public final class DexsqlClient {
     }
 
     public CacheInfo clearCache() {
-        HttpRequest req = HttpRequest.newBuilder(base.resolve("/api/cache"))
-                .timeout(requestTimeout)
-                .header("accept", "application/json")
-                .DELETE()
-                .build();
+        HttpRequest req = request("/api/cache").DELETE().build();
         send(req);
         return cache();
     }
@@ -248,21 +255,25 @@ public final class DexsqlClient {
         return body;
     }
 
-    private JsonNode get(String path) {
-        HttpRequest req = HttpRequest.newBuilder(base.resolve(path))
+    /** Applies the accept header and, when configured, the bearer token. */
+    private HttpRequest.Builder request(String path) {
+        HttpRequest.Builder b = HttpRequest.newBuilder(base.resolve(path))
                 .timeout(requestTimeout)
-                .header("accept", "application/json")
-                .GET()
-                .build();
-        return send(req);
+                .header("accept", "application/json");
+        if (token != null) {
+            b.header("Authorization", "Bearer " + token);
+        }
+        return b;
+    }
+
+    private JsonNode get(String path) {
+        return send(request(path).GET().build());
     }
 
     private JsonNode post(String path, JsonNode body) {
         try {
-            HttpRequest req = HttpRequest.newBuilder(base.resolve(path))
-                    .timeout(requestTimeout)
+            HttpRequest req = request(path)
                     .header("content-type", "application/json")
-                    .header("accept", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body), StandardCharsets.UTF_8))
                     .build();
             return send(req);

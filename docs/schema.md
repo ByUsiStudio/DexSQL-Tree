@@ -2,9 +2,10 @@
 
 本文件由 `dexsql-tree tables --json` 生成，与二进制内置目录一致。列类型为逻辑类型：`UInt32`/`Int64` 映射 SQLite INTEGER，`Float64` 映射 REAL，`Utf8`/`Utf8View` 映射 TEXT，`Boolean` 映射 0/1。
 
-两个使用约定：
+三条使用约定：
 
-- `debug_positions` 与 `debug_locals` 默认是空表。它们由 `--debug` 开启；大型 DEX 的行号程序常常比代码本身更大（例如 11 MB 的 K-9 有 725 万条 position），默认不物化。
+- **表存在不等于有数据**。0.4.0 起只物化语句读到的表；未物化的表结构仍在，但查询它会明确报错（CLI 提示加 `--all-tables`），而不是返回 0 行。`fast` 档另外默认跳过 `method_refs`、`method_using_numbers`、`id_items` 三张派生表；语句点名它们时会按需构建。
+- `debug_positions` 与 `debug_locals` 默认是空表。它们由 `--debug` 开启，并且只有语句引用调试表时才写入；大型 DEX 的行号程序常常比代码本身更大（例如 11 MB 的 K-9 有 725 万条 position）。
 - `method_refs."index"` 是 SQLite 关键字，查询时必须写成 `"index"` 或 `method_refs.[index]`。
 
 ## 一览

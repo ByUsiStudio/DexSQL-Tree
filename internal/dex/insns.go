@@ -107,10 +107,10 @@ func (f *File) parseCodeItem(methodIdx, off uint32) (*CodeItem, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	if ci.InsnsSize > uint32(len(f.raw))/2 {
-		return nil, fmt.Errorf("insns_size %d implausible", ci.InsnsSize)
-	}
 	ci.InsnsOff = uint32(r.off)
+	if !fits(ci.InsnsOff, ci.InsnsSize, 2, len(f.raw)) {
+		return nil, fmt.Errorf("insns_size %d at %d exceeds the file", ci.InsnsSize, ci.InsnsOff)
+	}
 	ci.Insns = make([]uint16, ci.InsnsSize)
 	for i := range ci.Insns {
 		ci.Insns[i] = binary.LittleEndian.Uint16(f.raw[int(ci.InsnsOff)+i*2:])

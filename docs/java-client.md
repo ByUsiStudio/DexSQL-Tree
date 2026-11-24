@@ -17,7 +17,7 @@ mvn install     # 安装到本地仓库，后续 javafx:run 才能解析 client 
 产物：
 
 - `dexsql-tree-client/target/dexsql-tree-client-0.3.0.jar`
-- `dexsql-tree-gui/target/dexsql-tree-gui-0.3.0.jar`
+- `dexsql-tree-gui/target/dexsql-tree-gui-0.4.0.jar`
 
 ## 2. 用现成引擎
 
@@ -32,6 +32,14 @@ QueryResult r = client.query("""
         LIMIT 20
         """);
 ```
+
+引擎用 `serve --token SECRET` 启动时，把 token 传进构造函数即可，每个请求都会带上 `Authorization: Bearer`：
+
+```java
+DexsqlClient client = new DexsqlClient("http://127.0.0.1:8765", Duration.ofMinutes(5), "SECRET");
+```
+
+GUI 顶栏的地址输入框右侧有一个 `token` 输入框，连不上时先确认两边是否一致。
 
 `QueryResult`：
 

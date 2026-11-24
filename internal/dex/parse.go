@@ -121,8 +121,20 @@ func Parse(data []byte, sourcePath, entryName string, fileID uint32, opts ...Opt
 	return f, nil
 }
 
+// fits reports whether count items of size bytes, starting at off, fit within
+// dataLen. Header and map counts are attacker-controlled: a 400-byte file can
+// claim four billion strings, and allocating before the first bounds check
+// kills the process instead of failing the parse.
+func fits(off, count, size uint32, dataLen int) bool {
+	return uint64(off)+uint64(count)*uint64(size) <= uint64(dataLen)
+}
+
 func (f *File) parseStrings(data []byte) error {
 	h := f.Header
+	if !fits(h.StringIDsOff, h.StringCount, 4, len(data)) {
+		return fmt.Errorf("dex: string_ids section (%d entries at %d) exceeds %d bytes",
+			h.StringCount, h.StringIDsOff, len(data))
+	}
 	f.Strings = make([]string, h.StringCount)
 	f.StringOffsets = make([]uint32, h.StringCount)
 	for i := uint32(0); i < h.StringCount; i++ {
@@ -162,6 +174,10 @@ func (f *File) typeDesc(idx uint32) string {
 
 func (f *File) parseTypes(data []byte) error {
 	h := f.Header
+	if !fits(h.TypeIDsOff, h.TypeCount, 4, len(data)) {
+		return fmt.Errorf("dex: type_ids section (%d entries at %d) exceeds %d bytes",
+			h.TypeCount, h.TypeIDsOff, len(data))
+	}
 	f.TypeDescs = make([]string, h.TypeCount)
 	f.TypeStringIdx = make([]uint32, h.TypeCount)
 	for i := uint32(0); i < h.TypeCount; i++ {
@@ -178,6 +194,10 @@ func (f *File) parseTypes(data []byte) error {
 
 func (f *File) parseProtos(data []byte) error {
 	h := f.Header
+	if !fits(h.ProtoIDsOff, h.ProtoCount, 12, len(data)) {
+		return fmt.Errorf("dex: proto_ids section (%d entries at %d) exceeds %d bytes",
+			h.ProtoCount, h.ProtoIDsOff, len(data))
+	}
 	f.Protos = make([]Proto, h.ProtoCount)
 	for i := uint32(0); i < h.ProtoCount; i++ {
 		base := int(h.ProtoIDsOff + i*12)
@@ -215,6 +235,10 @@ func (f *File) parseProtos(data []byte) error {
 
 func (f *File) parseFields(data []byte) error {
 	h := f.Header
+	if !fits(h.FieldIDsOff, h.FieldCount, 8, len(data)) {
+		return fmt.Errorf("dex: field_ids section (%d entries at %d) exceeds %d bytes",
+			h.FieldCount, h.FieldIDsOff, len(data))
+	}
 	f.Fields = make([]FieldID, h.FieldCount)
 	for i := uint32(0); i < h.FieldCount; i++ {
 		base := int(h.FieldIDsOff + i*8)
@@ -237,6 +261,10 @@ func (f *File) parseFields(data []byte) error {
 
 func (f *File) parseMethods(data []byte) error {
 	h := f.Header
+	if !fits(h.MethodIDsOff, h.MethodCount, 8, len(data)) {
+		return fmt.Errorf("dex: method_ids section (%d entries at %d) exceeds %d bytes",
+			h.MethodCount, h.MethodIDsOff, len(data))
+	}
 	f.Methods = make([]MethodID, h.MethodCount)
 	for i := uint32(0); i < h.MethodCount; i++ {
 		base := int(h.MethodIDsOff + i*8)
@@ -280,7 +308,7 @@ func (f *File) parseMap(data []byte) error {
 	if r.err != nil {
 		return r.err
 	}
-	if int(h.MapOff)+4+int(n)*12 > len(data) {
+	if !fits(h.MapOff+4, n, 12, len(data)) {
 		return fmt.Errorf("dex: map_list out of range")
 	}
 	f.MapItems = make([]MapItem, 0, n)
@@ -297,6 +325,10 @@ func (f *File) parseMap(data []byte) error {
 
 func (f *File) parseClassDefs(data []byte) error {
 	h := f.Header
+	if !fits(h.ClassDefsOff, h.ClassCount, 32, len(data)) {
+		return fmt.Errorf("dex: class_defs section (%d entries at %d) exceeds %d bytes",
+			h.ClassCount, h.ClassDefsOff, len(data))
+	}
 	f.Classes = make([]ClassDef, h.ClassCount)
 	for i := uint32(0); i < h.ClassCount; i++ {
 		base := int(h.ClassDefsOff + i*32)
@@ -379,6 +411,12 @@ func (f *File) parseClassData(data []byte, off uint32) (*ClassData, error) {
 		return nil, r.err
 	}
 	readFields := func(n uint32, kind string) []EncodedField {
+		// Each entry is at least two uleb128 values, so the file cannot hold
+		// more entries than it has bytes.
+		if !fits(uint32(r.off), n, 2, len(data)) {
+			r.err = fmt.Errorf("class_data field count %d exceeds the remaining bytes", n)
+			return nil
+		}
 		out := make([]EncodedField, 0, n)
 		var idx uint32
 		for i := uint32(0); i < n; i++ {
@@ -395,6 +433,10 @@ func (f *File) parseClassData(data []byte, off uint32) (*ClassData, error) {
 	cd.StaticFields = readFields(ns, "static")
 	cd.InstanceFields = readFields(ni, "instance")
 	readMethods := func(n uint32, kind string) []EncodedMethod {
+		if !fits(uint32(r.off), n, 3, len(data)) {
+			r.err = fmt.Errorf("class_data method count %d exceeds the remaining bytes", n)
+			return nil
+		}
 		out := make([]EncodedMethod, 0, n)
 		var idx uint32
 		for i := uint32(0); i < n; i++ {
@@ -450,6 +492,9 @@ func (f *File) parseMethodHandles(data []byte) error {
 	if size == 0 || off == 0 {
 		return nil
 	}
+	if !fits(off, size, 8, len(data)) {
+		return fmt.Errorf("dex: method_handles (%d entries at %d) exceeds %d bytes", size, off, len(data))
+	}
 	f.MethodHandles = make([]MethodHandle, 0, size)
 	for i := uint32(0); i < size; i++ {
 		base := int(off + i*8)
@@ -474,6 +519,9 @@ func (f *File) parseCallSites(data []byte) error {
 	}
 	if size == 0 || off == 0 {
 		return nil
+	}
+	if !fits(off, size, 4, len(data)) {
+		return fmt.Errorf("dex: call_sites (%d entries at %d) exceeds %d bytes", size, off, len(data))
 	}
 	f.CallSites = make([]CallSite, 0, size)
 	for i := uint32(0); i < size; i++ {

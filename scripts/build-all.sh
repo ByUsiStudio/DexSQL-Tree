@@ -6,11 +6,11 @@
 #
 # Usage:
 #   scripts/build-all.sh                 build into dist/dexsql-tree-<version>
-#   VERSION=0.3.0 scripts/build-all.sh   override the version stamped into the binary
+#   VERSION=0.4.0 scripts/build-all.sh   override the version stamped into the binary
 #   OUT=/tmp/out scripts/build-all.sh    override the output directory
 set -euo pipefail
 
-VERSION="${VERSION:-0.3.0}"
+VERSION="${VERSION:-0.4.0}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${OUT:-$ROOT/dist/dexsql-tree-$VERSION}"
 LDFLAGS="-s -w -X github.com/byusi-studio/dexsql-tree/internal/api.Version=$VERSION"

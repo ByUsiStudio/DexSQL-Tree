@@ -83,6 +83,7 @@ public final class DexsqlTreeApp extends Application {
 
     // Header
     private final TextField addressField = new TextField(DEFAULT_URL);
+    private final TextField tokenField = new TextField();
     private final Circle statusDot = new Circle(5);
     private final Label datasetLabel = new Label("No dataset");
     private final Button connectButton = new Button("Connect");
@@ -180,8 +181,11 @@ public final class DexsqlTreeApp extends Application {
 
         statusDot.getStyleClass().add("status-off");
 
-        addressField.setPrefWidth(250);
+        addressField.setPrefWidth(230);
         addressField.setOnAction(e -> connect());
+        tokenField.setPromptText("token");
+        tokenField.setPrefWidth(96);
+        tokenField.setOnAction(e -> connect());
         connectButton.getStyleClass().add("primary");
         connectButton.setOnAction(e -> connect());
         openButton.setOnAction(e -> chooseApk());
@@ -192,7 +196,7 @@ public final class DexsqlTreeApp extends Application {
 
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
-        HBox box = new HBox(10, brand, tagline, spacer, statusDot, addressField,
+        HBox box = new HBox(10, brand, tagline, spacer, statusDot, addressField, tokenField,
                 connectButton, openButton, cacheButton, datasetLabel);
         box.setAlignment(Pos.CENTER_LEFT);
         box.getStyleClass().add("header");
@@ -543,7 +547,8 @@ public final class DexsqlTreeApp extends Application {
         if (url.isEmpty()) {
             return;
         }
-        DexsqlClient candidate = new DexsqlClient(url);
+        DexsqlClient candidate = new DexsqlClient(url, java.time.Duration.ofMinutes(5),
+                tokenField.getText().trim());
         submit(() -> {
             Health h = candidate.healthInfo();
             List<TableInfo> tables = candidate.tables();

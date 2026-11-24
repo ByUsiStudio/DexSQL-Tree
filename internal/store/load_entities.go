@@ -47,9 +47,14 @@ func (l *loader) dexFiles() error {
 }
 
 func (l *loader) strings() error {
+	b := l.batch("strings")
+	if b == nil {
+		return nil
+	}
 	for _, f := range l.s.Container.Files {
 		for i, s := range f.Strings {
-			if err := l.ins("strings", int64(f.FileID), int64(i), s); err != nil {
+			b.rows = append(b.rows, int64(f.FileID), int64(i), s)
+			if err := l.done(b); err != nil {
 				return err
 			}
 		}
@@ -58,13 +63,24 @@ func (l *loader) strings() error {
 }
 
 func (l *loader) types() error {
+	ids := l.batch("type_ids")
+	types := l.batch("types")
+	if ids == nil && types == nil {
+		return nil
+	}
 	for _, f := range l.s.Container.Files {
 		for i, d := range f.TypeDescs {
-			if err := l.ins("type_ids", int64(f.FileID), int64(i), int64(f.TypeStringIdx[i])); err != nil {
-				return err
+			if ids != nil {
+				ids.rows = append(ids.rows, int64(f.FileID), int64(i), int64(f.TypeStringIdx[i]))
+				if err := l.done(ids); err != nil {
+					return err
+				}
 			}
-			if err := l.ins("types", int64(f.FileID), int64(i), d, dex.JavaName(d)); err != nil {
-				return err
+			if types != nil {
+				types.rows = append(types.rows, int64(f.FileID), int64(i), d, dex.JavaName(d))
+				if err := l.done(types); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -117,12 +133,27 @@ func (l *loader) fields() error {
 }
 
 func (l *loader) methods() error {
+	ids := l.batch("method_ids")
+	all := l.batch("methods")
+	ops := l.batch("method_opcodes")
+	if ids == nil && all == nil && ops == nil {
+		return nil
+	}
 	for _, f := range l.s.Container.Files {
-		defs := methodDefs(f)
+		var defs map[uint32]methodDef
+		if all != nil || ops != nil {
+			defs = methodDefs(f)
+		}
 		for _, m := range f.Methods {
-			if err := l.ins("method_ids", int64(f.FileID), int64(m.Index), int64(m.ClassIdx),
-				int64(m.ProtoIdx), int64(m.NameIdx)); err != nil {
-				return err
+			if ids != nil {
+				ids.rows = append(ids.rows, int64(f.FileID), int64(m.Index), int64(m.ClassIdx),
+					int64(m.ProtoIdx), int64(m.NameIdx))
+				if err := l.done(ids); err != nil {
+					return err
+				}
+			}
+			if all == nil && ops == nil {
+				continue
 			}
 			var access, opCount any
 			var opHex any
@@ -137,17 +168,21 @@ func (l *loader) methods() error {
 					opCount = int64(0)
 					opHex = ""
 				}
-			} else {
-				access, opCount, opHex, kind = nil, nil, nil, nil
 			}
-			joined := joinComma(m.ParamDescs)
-			if err := l.ins("methods", int64(f.FileID), int64(m.Index), int64(m.ClassIdx), m.ClassDesc,
-				int64(m.ProtoIdx), m.Name, m.Descriptor, m.ReturnDesc, int64(len(m.ParamDescs)),
-				joined, access, opCount, opHex, kind); err != nil {
-				return err
+			if all != nil {
+				joined := joinComma(m.ParamDescs)
+				all.rows = append(all.rows, int64(f.FileID), int64(m.Index), int64(m.ClassIdx), m.ClassDesc,
+					int64(m.ProtoIdx), m.Name, m.Descriptor, m.ReturnDesc, int64(len(m.ParamDescs)),
+					joined, access, opCount, opHex, kind)
+				if err := l.done(all); err != nil {
+					return err
+				}
 			}
-			if err := l.ins("method_opcodes", int64(f.FileID), int64(m.Index), opCount, opHex); err != nil {
-				return err
+			if ops != nil {
+				ops.rows = append(ops.rows, int64(f.FileID), int64(m.Index), opCount, opHex)
+				if err := l.done(ops); err != nil {
+					return err
+				}
 			}
 		}
 	}
