@@ -132,3 +132,61 @@ func TestEveryRecipeIsValidSQL(t *testing.T) {
 		}
 	}
 }
+
+// The index-only tables must not change what a query sees: same columns in the
+// same order, and the same number of rows. A LEFT join that silently dropped a
+// callee outside method_ids would make count(*) lie.
+func TestViewsMirrorBaseTables(t *testing.T) {
+	s := openHello(t)
+
+	for _, c := range [][2]string{
+		{"method_calls", "_call_sites"},
+		{"method_field_accesses", "_field_accesses"},
+		{"method_used_types", "_used_types"},
+		{"method_strings", "_string_refs"},
+	} {
+		rel, ok := store.Relation(c[0])
+		if !ok || rel.Kind != "view" {
+			t.Fatalf("%s should be a view, got %+v", c[0], rel)
+		}
+		got := queryStrings(t, s, "SELECT count(*) FROM "+c[0])
+		want := queryStrings(t, s, "SELECT count(*) FROM "+c[1])
+		if got[0] != want[0] {
+			t.Errorf("%s has %s rows, %s has %s", c[0], got[0], c[1], want[0])
+		}
+	}
+
+	names := queryStrings(t, s, "SELECT name FROM pragma_table_info('method_calls')")
+	want := []string{"method", "method_class", "method_name", "callee", "callee_class",
+		"callee_name", "file_id", "class_idx", "method_idx", "callee_method_idx"}
+	if len(names) != len(want) {
+		t.Fatalf("method_calls columns = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("method_calls columns = %v, want %v", names, want)
+		}
+	}
+
+	if res := queryStrings(t, s, "SELECT callee FROM method_calls"); len(res) != 1 ||
+		res[0] != "Ljava/io/PrintStream;->println(Ljava/lang/String;)V" {
+		t.Fatalf("callee did not resolve: %v", res)
+	}
+	// callee_name needs the methods join, not just the stored descriptor.
+	if res := queryStrings(t, s, "SELECT callee_name FROM method_calls"); len(res) != 1 || res[0] != "println" {
+		t.Fatalf("callee_name did not resolve through the join: %v", res)
+	}
+}
+
+// Internal tables are addressable (the playground shows them) but must not be
+// advertised as part of the schema people are meant to learn.
+func TestAllRelationsHidesInternalTables(t *testing.T) {
+	for _, r := range store.AllRelations() {
+		if strings.HasPrefix(r.Name, "_") {
+			t.Fatalf("internal table %s advertised by AllRelations", r.Name)
+		}
+	}
+	if _, ok := store.Relation("_call_sites"); !ok {
+		t.Fatalf("internal table should still be addressable")
+	}
+}

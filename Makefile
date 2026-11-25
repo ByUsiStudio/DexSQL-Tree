@@ -1,5 +1,5 @@
 BIN := bin/dexsql-tree
-VERSION ?= 0.4.0
+VERSION ?= 1.0.0
 LDFLAGS := -s -w -X github.com/byusi-studio/dexsql-tree/internal/api.Version=$(VERSION)
 
 .PHONY: all build test java demo fmt vet clean release cross

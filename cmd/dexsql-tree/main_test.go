@@ -59,3 +59,21 @@ func TestWriteBlockRoundTrip(t *testing.T) {
 		t.Fatalf("profile should be restored, got %q", b)
 	}
 }
+
+// The size line is the first thing a newcomer reads; raw counts are hard to
+// size at a glance.
+func TestThousands(t *testing.T) {
+	for in, want := range map[int]string{0: "0", 999: "999", 1000: "1,000", 64586: "64,586", 1234567: "1,234,567"} {
+		if got := thousands(in); got != want {
+			t.Errorf("thousands(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Without an input the first-run command must say so instead of opening an
+// empty catalog.
+func TestStartNeedsInput(t *testing.T) {
+	if err := cmdStart(nil); err == nil {
+		t.Fatal("start without --input should fail")
+	}
+}

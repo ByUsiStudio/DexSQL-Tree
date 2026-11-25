@@ -19,30 +19,32 @@ import (
 // would get from a hand-written database. There is no silent wrong answer,
 // because Query verifies the plan against what the catalog actually built.
 
-// viewDeps maps each convenience view to the base tables its DDL reads. The
-// view definitions are static, so the dependency list is written down here
-// instead of being re-parsed at runtime.
+// viewDeps maps each relation that is not a physical table to the relations its
+// DDL reads. A view may depend on another view: resolution recurses, so naming
+// v_overview still ends at base tables.
 var viewDeps = map[string][]string{
-	"v_methods":  {"methods", "types"},
-	"v_fields":   {"fields", "types"},
-	"v_overview": {"dex_files", "classes", "methods", "fields", "strings", "method_calls", "method_strings", "annotations"},
+	"v_methods":             {"methods", "types"},
+	"v_fields":              {"fields", "types"},
+	"method_calls":          {"_call_sites", "methods"},
+	"method_field_accesses": {"_field_accesses", "methods", "fields"},
+	"method_used_types":     {"_used_types", "methods", "types"},
+	"method_strings":        {"_string_refs", "methods", "strings"},
+	"method_using_numbers":  {"method_numbers", "methods"},
+	"v_overview":            {"dex_files", "classes", "methods", "fields", "strings", "_call_sites", "_string_refs", "annotations"},
 }
 
 // derivedFast lists tables that a fast build leaves empty by default because
 // they are supersets of other tables:
 //
-//	method_refs           every ref of method_calls + method_field_accesses +
-//	                      method_used_types + method_strings + method_numbers
-//	method_using_numbers  the same rows as method_numbers, with the caller
-//	                      columns already present in that table
+//	method_refs           every ref of the call/field/type/string tables plus
+//	                      method_numbers
 //	id_items              raw byte offsets, only useful for forensic queries
 //
 // A statement that names one of them explicitly still gets it: the point of
 // on-demand materialisation is that the query decides, not the profile.
 var derivedFast = map[string]bool{
-	"method_refs":          true,
-	"method_using_numbers": true,
-	"id_items":             true,
+	"method_refs": true,
+	"id_items":    true,
 }
 
 // AllTables returns every catalog table in declaration order.

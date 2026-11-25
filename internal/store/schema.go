@@ -103,24 +103,21 @@ var Catalog = []Table{
 	{Name: "method_numbers", Doc: "Immediate numeric constants loaded by bytecode.", Cols: []string{
 		"file_id UInt32", "class_idx UInt32", "method_idx UInt32", "opcode UInt32", "number_type Utf8",
 		"long_value Int64", "double_value Float64?"}},
-	{Name: "method_strings", Doc: "String constants referenced by each method (one row per instruction).", Cols: []string{
-		"method Utf8View", "method_class Utf8View", "method_name Utf8View", "value Utf8View",
+	// The four relations below are the storage form of the *_calls / *_strings /
+	// *_used_types / *_field_accesses views. A call instruction repeats its
+	// caller's descriptor on every row, which on a mid-sized APK meant ~100 MB
+	// of duplicate text and 190 MB of catalog for 327k rows. Storing indices
+	// only and resolving names through methods/fields/types/strings keeps every
+	// public column while cutting the file to a fraction. Names are internal
+	// (leading underscore) so `tables` does not advertise them.
+	{Name: "_call_sites", Doc: "Internal: call instructions as indices only; see the method_calls view.", Cols: []string{
+		"file_id UInt32", "class_idx UInt32", "method_idx UInt32", "callee_method_idx UInt32", "callee Utf8View"}},
+	{Name: "_field_accesses", Doc: "Internal: field instructions as indices only; see the method_field_accesses view.", Cols: []string{
+		"file_id UInt32", "class_idx UInt32", "method_idx UInt32", "field_idx UInt32", "using_type Utf8?"}},
+	{Name: "_used_types", Doc: "Internal: type-referencing instructions as indices only; see the method_used_types view.", Cols: []string{
+		"file_id UInt32", "class_idx UInt32", "method_idx UInt32", "type_idx UInt32"}},
+	{Name: "_string_refs", Doc: "Internal: string constants as indices only; see the method_strings view.", Cols: []string{
 		"file_id UInt32", "class_idx UInt32", "method_idx UInt32", "string_idx UInt32"}},
-	{Name: "method_calls", Doc: "Call instructions: caller columns plus callee columns.", Cols: []string{
-		"method Utf8View", "method_class Utf8View", "method_name Utf8View", "callee Utf8View",
-		"callee_class Utf8View", "callee_name Utf8View", "file_id UInt32", "class_idx UInt32",
-		"method_idx UInt32", "callee_method_idx UInt32"}},
-	{Name: "method_field_accesses", Doc: "Field read/write instructions.", Cols: []string{
-		"method Utf8View", "method_class Utf8View", "method_name Utf8View", "field Utf8View",
-		"field_class Utf8View", "field_name Utf8View", "field_type Utf8View", "using_type Utf8?",
-		"file_id UInt32", "class_idx UInt32", "method_idx UInt32", "field_idx UInt32"}},
-	{Name: "method_used_types", Doc: "Type-referencing instructions (check-cast, new-instance, ...).", Cols: []string{
-		"method Utf8View", "method_class Utf8View", "method_name Utf8View", "type_descriptor Utf8View",
-		"type_name Utf8View", "file_id UInt32", "class_idx UInt32", "method_idx UInt32", "type_idx UInt32"}},
-	{Name: "method_using_numbers", Doc: "Immediate numeric constants with the using method resolved.", Cols: []string{
-		"method Utf8View", "method_class Utf8View", "method_name Utf8View", "number_type Utf8",
-		"long_value Int64", "double_value Float64?", "opcode UInt32", "file_id UInt32",
-		"class_idx UInt32", "method_idx UInt32"}},
 	{Name: "code_items", Doc: "code_item header and instruction layout.", Cols: []string{
 		"file_id UInt32", "method_idx UInt32", "code_off UInt32", "registers_size UInt32", "ins_size UInt32",
 		"outs_size UInt32", "tries_size UInt32", "debug_info_off UInt32", "insns_size UInt32",
@@ -221,12 +218,14 @@ func sqlType(t string) string {
 // column names. Users must quote the same identifier in their queries.
 func quote(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 
-// DDL returns the CREATE statements for the whole catalog.
+// DDL returns the CREATE statements for the whole catalog. IF NOT EXISTS makes
+// the same statements usable when a cached catalog is grown in place: the
+// tables that are already there are skipped, the missing ones are created.
 func DDL() []string {
 	out := make([]string, 0, len(Catalog)+8)
 	for _, t := range Catalog {
 		var b strings.Builder
-		fmt.Fprintf(&b, "CREATE TABLE %s (", quote(t.Name))
+		fmt.Fprintf(&b, "CREATE TABLE IF NOT EXISTS %s (", quote(t.Name))
 		for i := range t.Cols {
 			name, typ := t.Column(i)
 			if i > 0 {

@@ -92,6 +92,8 @@ func main() {
 	}
 	cmd, rest := args[0], args[1:]
 	switch cmd {
+	case "start", "tour":
+		err = cmdStart(rest)
 	case "query", "q":
 		err = cmdQuery(rest)
 	case "search", "find":
@@ -133,6 +135,7 @@ func main() {
 const usageEN = `dexsql-tree - SQL and call trees for Android APK/DEX files
 
 Usage:
+  dexsql-tree start   --input app.apk           first look: size plus three queries
   dexsql-tree query   --input app.apk --sql "SELECT ..." [--limit 200] [--format table|json|csv|md]
   dexsql-tree query   --input app.apk --recipe callers --arg method='Lcom/x;->y()V'
   dexsql-tree search  --input app.apk --keyword password [--kind class|method|field|string]
@@ -143,7 +146,7 @@ Usage:
   dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
   dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765] [--token SECRET]
   dexsql-tree mcp     [--input app.apk]
-  dexsql-tree cache   list|clear|path|info      manage the persisted catalog cache
+  dexsql-tree cache   list|clear|prune|path|info manage the persisted catalog cache
   dexsql-tree lang    set zh --write            enable Chinese prompts permanently
 
 Language:
@@ -169,6 +172,7 @@ Repeat --input to query several APK/DEX files together.
 const usageZH = `dexsql-tree —— Android APK/DEX 的 SQL 查询与调用树浏览器
 
 用法:
+  dexsql-tree start   --input app.apk           首次查看：规模加三条查询
   dexsql-tree query   --input app.apk --sql "SELECT ..." [--limit 200] [--format table|json|csv|md]
   dexsql-tree query   --input app.apk --recipe callers --arg method='Lcom/x;->y()V'
   dexsql-tree search  --input app.apk --keyword 密码 [--kind class|method|field|string]
@@ -179,7 +183,7 @@ const usageZH = `dexsql-tree —— Android APK/DEX 的 SQL 查询与调用树�
   dexsql-tree smali   --input app.apk --method 'Lcom/x;->y()V'
   dexsql-tree serve   --input app.apk [--addr 127.0.0.1:8765] [--token SECRET]
   dexsql-tree mcp     [--input app.apk]
-  dexsql-tree cache   list|clear|path|info      管理磁盘目录缓存
+  dexsql-tree cache   list|clear|prune|path|info 管理磁盘目录缓存
   dexsql-tree lang    set zh --write            永久开启中文提示
 
 语言:
@@ -262,7 +266,7 @@ func (m *multiFlag) storeOptions(disk bool) (store.Options, error) {
 	if err != nil {
 		return store.Options{}, err
 	}
-	opt := store.Options{Disk: disk, Profile: profile}
+	opt := store.Options{Disk: disk, Profile: profile, Version: api.Version}
 	if m.cache {
 		dir := m.cacheDir
 		if dir == "" {
@@ -272,6 +276,129 @@ func (m *multiFlag) storeOptions(disk bool) (store.Options, error) {
 		opt.CacheKey = cache.Key(m.paths, string(profile), api.Version, m.debug)
 	}
 	return opt, nil
+}
+
+// cmdStart is the first-run experience: size the input, ask three questions
+// that are worth asking of any APK, and end each block with a command that goes
+// deeper. It is not a tutorial — every suggestion is copyable.
+func cmdStart(args []string) error {
+	fs := flag.NewFlagSet("start", flag.ContinueOnError)
+	var inputs multiFlag
+	addInputFlags(fs, &inputs)
+	limit := fs.Int("limit", 6, i18n.T("rows per example", "每个示例的行数"))
+	format := fs.String("format", "table", i18n.T("table|json|csv|md", "table|json|csv|md"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(inputs.paths) == 0 {
+		return fmt.Errorf(i18n.T("start needs --input app.apk", "start 需要 --input app.apk"))
+	}
+	c, err := inputs.load()
+	if err != nil {
+		return err
+	}
+	opt, err := inputs.storeOptions(false)
+	if err != nil {
+		return err
+	}
+	// Lazy: the three examples pay only for the tables they read.
+	opt.Lazy = true
+	st, err := store.Open(c, opt)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	path := inputs.paths[0]
+	s := st.Stats
+	fmt.Printf("%s  %s · %d DEX · %s %s · %s %s · %s %s\n\n",
+		filepath.Base(path), humanBytes(s.DexBytes), s.Files,
+		thousands(s.Methods), i18n.T("methods", "方法"),
+		thousands(s.Classes), i18n.T("classes", "类"),
+		thousands(s.Strings), i18n.T("strings", "字符串"))
+
+	examples := []struct {
+		title string
+		sql   string
+		next  string
+	}{
+		{
+			title: i18n.T("Which classes carry the most methods?", "哪些类的方法最多？"),
+			// class_methods counts what the class itself declares; methods would
+			// rank framework classes by how often they are referenced.
+			sql: `SELECT class_descriptor AS class, count(*) AS methods
+FROM class_methods GROUP BY class_descriptor ORDER BY methods DESC LIMIT ` + strconv.Itoa(*limit),
+			next: i18n.T("dexsql-tree tables class_methods   # what else this table holds",
+				"dexsql-tree tables class_methods   # 这张表还有哪些列"),
+		},
+		{
+			title: i18n.T("Is anything hardcoded in the strings?", "字符串里有没有写死的东西？"),
+			// One row per answer: a multi-line HTML blob would break the table
+			// and tell a newcomer nothing.
+			sql: `SELECT substr(replace(replace(value, char(10), ' '), char(13), ' '), 1, 100) AS value
+FROM strings
+WHERE (value LIKE '%://%' OR value LIKE '%@%.%') AND length(value) < 200
+GROUP BY value ORDER BY length(value) DESC LIMIT ` + strconv.Itoa(*limit),
+			next: i18n.T(`dexsql-tree query --input `+path+` --sql "SELECT method, value FROM method_strings WHERE value LIKE '%token%' LIMIT 20"`,
+				`dexsql-tree query --input `+path+` --sql "SELECT method, value FROM method_strings WHERE value LIKE '%token%' LIMIT 20"`),
+		},
+		{
+			title: i18n.T("Where does execution start?", "执行从哪里开始？"),
+			// Framework classes answer every one of these names; hide them or
+			// the list is Android's own boilerplate.
+			sql: `SELECT class_descriptor AS class, name FROM methods
+WHERE name IN ('onCreate','main','onStartCommand','onReceive','attachBaseContext')
+  AND class_descriptor NOT LIKE 'Landroid/%'
+  AND class_descriptor NOT LIKE 'Landroidx/%'
+  AND class_descriptor NOT LIKE 'Ljava/%'
+  AND class_descriptor NOT LIKE 'Lkotlin/%'
+ORDER BY name LIMIT ` + strconv.Itoa(*limit),
+			next: i18n.T("dexsql-tree tree --input "+path+" --method '<descriptor>' --depth 2",
+				"dexsql-tree tree --input "+path+" --method '<descriptor>' --depth 2"),
+		},
+	}
+
+	for i, ex := range examples {
+		fmt.Printf("%d. %s\n", i+1, ex.title)
+		res, err := st.Query(ex.sql, *limit)
+		if err != nil {
+			// An example that fails must not abort the tour.
+			fmt.Printf("   %v\n\n", store.Suggest(err))
+			continue
+		}
+		text, err := render(res, *format)
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+			fmt.Printf("   %s\n", line)
+		}
+		fmt.Printf("   %s %s\n\n", i18n.T("next:", "接着试:"), ex.next)
+	}
+
+	fmt.Print(i18n.T(
+		"Add --cache to reopen in under a second. `dexsql-tree recipes` lists every built-in query,\n"+
+			"`dexsql-tree tables` explains what each relation holds.\n",
+		"加 --cache 后再次打开不到一秒。`dexsql-tree recipes` 列出全部内置模板，\n"+
+			"`dexsql-tree tables` 说明每张表放的是什么。\n"))
+	return nil
+}
+
+// thousands renders 64586 as 64,586; the size line is the first thing a
+// newcomer reads and a raw count is hard to size at a glance.
+func thousands(n int) string {
+	s := strconv.Itoa(n)
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
 }
 
 func cmdQuery(args []string) error {
@@ -373,7 +500,7 @@ func cmdQuery(args []string) error {
 	run := func(q string) error {
 		res, err := st.Query(q, *limit)
 		if err != nil {
-			return err
+			return store.Suggest(err)
 		}
 		text, err := render(res, *format)
 		if err != nil {
@@ -462,7 +589,7 @@ func repl(st *store.Store) error {
 		buf.Reset()
 		res, err := st.Query(q, 200)
 		if err != nil {
-			fmt.Println(i18n.T("error:", "错误:") + " " + err.Error())
+			fmt.Println(i18n.T("error:", "错误:") + " " + store.Suggest(err).Error())
 			continue
 		}
 		text, _ := render(res, "table")
@@ -1373,6 +1500,35 @@ func cmdCache(args []string) error {
 			return err
 		}
 		fmt.Printf(i18n.T("removed %d catalogs (%s) from %s\n", "已删除 %d 个目录（%s），位置 %s\n"), n, humanBytes(b), dir)
+	case "prune":
+		// The key already includes the version, so an old catalog is never
+		// reused — but it also never disappears on its own, and one 0.3.0
+		// catalog for an 11 MB APK is half a gigabyte.
+		ents, err := cache.List(dir)
+		if err != nil {
+			return err
+		}
+		var removed, kept int
+		var freed int64
+		for _, e := range ents {
+			v, verr := store.CatalogVersion(e.Path)
+			if verr == nil && v == api.Version {
+				kept++
+				continue
+			}
+			if err := os.Remove(e.Path); err != nil {
+				continue
+			}
+			removed++
+			freed += e.Size
+		}
+		if removed == 0 {
+			fmt.Printf(i18n.T("nothing to prune: %d catalogs match %s\n",
+				"没有可清理的目录：%d 个与 %s 匹配\n"), kept, api.Version)
+			return nil
+		}
+		fmt.Printf(i18n.T("pruned %d stale catalogs (%s), kept %d\n",
+			"已清理 %d 个旧目录（%s），保留 %d 个\n"), removed, humanBytes(freed), kept)
 	case "path", "dir":
 		fmt.Println(dir)
 	case "info":
@@ -1419,7 +1575,7 @@ func cmdCache(args []string) error {
 		fmt.Printf("%s %s\n", padDisplay(i18n.T("built:", "生成于:"), 12), newest.Format("2006-01-02 15:04:05"))
 		fmt.Printf("%s %s\n", padDisplay(i18n.T("profile:", "档位:"), 12), profile)
 	default:
-		return fmt.Errorf(i18n.T("unknown cache action %q (list|clear|path|info)", "未知的 cache 操作 %q（list|clear|path|info）"), action)
+		return fmt.Errorf(i18n.T("unknown cache action %q (list|clear|prune|path|info)", "未知的 cache 操作 %q（list|clear|prune|path|info）"), action)
 	}
 	return nil
 }

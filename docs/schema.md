@@ -2,9 +2,10 @@
 
 本文件由 `dexsql-tree tables --json` 生成，与二进制内置目录一致。列类型为逻辑类型：`UInt32`/`Int64` 映射 SQLite INTEGER，`Float64` 映射 REAL，`Utf8`/`Utf8View` 映射 TEXT，`Boolean` 映射 0/1。
 
-三条使用约定：
+四条使用约定：
 
-- **表存在不等于有数据**。0.4.0 起只物化语句读到的表；未物化的表结构仍在，但查询它会明确报错（CLI 提示加 `--all-tables`），而不是返回 0 行。`fast` 档另外默认跳过 `method_refs`、`method_using_numbers`、`id_items` 三张派生表；语句点名它们时会按需构建。
+- **表存在不等于有数据**。0.4.0 起只物化语句读到的表；未物化的表结构仍在，但查询它会明确报错（CLI 提示加 `--all-tables`），而不是返回 0 行。`fast` 档另外默认跳过 `method_refs` 与 `id_items` 两张派生表；语句点名它们时会按需构建。
+- **五张引用关系是视图**。`method_calls`、`method_field_accesses`、`method_used_types`、`method_strings`、`method_using_numbers` 的列与之前完全相同，但底层只存整数索引（`_call_sites`、`_field_accesses`、`_used_types`、`_string_refs`），再 join `methods`/`fields`/`types`/`strings` 还原名字。按 callee 过滤仍走索引；`count(*)` 会真的 join，只想知道规模时用 `v_overview`。
 - `debug_positions` 与 `debug_locals` 默认是空表。它们由 `--debug` 开启，并且只有语句引用调试表时才写入；大型 DEX 的行号程序常常比代码本身更大（例如 11 MB 的 K-9 有 725 万条 position）。
 - `method_refs."index"` 是 SQLite 关键字，查询时必须写成 `"index"` 或 `method_refs.[index]`。
 
@@ -38,11 +39,11 @@
 | `map_items` | 5 | The DEX map_list. |
 | `method_refs` | 7 | Sparse per-instruction reference table over bytecode. |
 | `method_numbers` | 7 | Immediate numeric constants loaded by bytecode. |
-| `method_strings` | 8 | String constants referenced by each method (one row per instruction). |
-| `method_calls` | 10 | Call instructions: caller columns plus callee columns. |
-| `method_field_accesses` | 12 | Field read/write instructions. |
-| `method_used_types` | 9 | Type-referencing instructions (check-cast, new-instance, ...). |
-| `method_using_numbers` | 10 | Immediate numeric constants with the using method resolved. |
+| `method_strings` | 8 | String constants referenced by each method (one row per instruction). *view* |
+| `method_calls` | 10 | Call instructions: caller columns plus callee columns. *view* |
+| `method_field_accesses` | 12 | Field read/write instructions. *view* |
+| `method_used_types` | 9 | Type-referencing instructions (check-cast, new-instance, ...). *view* |
+| `method_using_numbers` | 10 | Immediate numeric constants with the using method resolved. *view* |
 | `code_items` | 12 | code_item header and instruction layout. |
 | `try_items` | 6 | Protected ranges inside a code item. |
 | `catch_handlers` | 8 | Typed catch and catch-all entries. |
@@ -90,6 +91,8 @@ SELECT * FROM v_overview;
 ```
 
 `java_class` 为 `demo.Hello` 这样的点分名；`class_descriptor` 仍是 `Ldemo/Hello;`，两者都在视图中。
+
+另外五张引用关系（`method_calls` 等）也是视图，但它们的列与历史上的表完全一致，因此列在下方"列定义"里而不是这里。
 
 ## 列定义
 
@@ -462,6 +465,8 @@ Immediate numeric constants loaded by bytecode.
 
 String constants referenced by each method (one row per instruction).
 
+> 视图：底层是 `_string_refs`，加上 `methods` 等的连接。`value` 由 `strings` 按 `(file_id, string_idx)` 连接得到。
+
 | 列 | 类型 |
 | --- | --- |
 | `method` | Utf8View |
@@ -476,6 +481,8 @@ String constants referenced by each method (one row per instruction).
 ### `method_calls`
 
 Call instructions: caller columns plus callee columns.
+
+> 视图：底层是 `_call_sites`，加上 `methods` 等的连接。底表保留 `callee` descriptor 以便按被调用者走索引；`method` 三列由 `methods` 连接得到。
 
 | 列 | 类型 |
 | --- | --- |
@@ -493,6 +500,8 @@ Call instructions: caller columns plus callee columns.
 ### `method_field_accesses`
 
 Field read/write instructions.
+
+> 视图：底层是 `_field_accesses`，加上 `methods` 等的连接。`field` 四列由 `fields` 连接得到。
 
 | 列 | 类型 |
 | --- | --- |
@@ -512,6 +521,8 @@ Field read/write instructions.
 ### `method_used_types`
 
 Type-referencing instructions (check-cast, new-instance, ...).
+
+> 视图：底层是 `_used_types`，加上 `methods` 等的连接。`type_descriptor`/`type_name` 由 `types` 连接得到。
 
 | 列 | 类型 |
 | --- | --- |

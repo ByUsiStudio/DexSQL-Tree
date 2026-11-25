@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/byusi-studio/dexsql-tree/internal/cache"
 	"github.com/byusi-studio/dexsql-tree/internal/dex"
 	"github.com/byusi-studio/dexsql-tree/internal/dextest"
 	"github.com/byusi-studio/dexsql-tree/internal/store"
@@ -39,8 +40,8 @@ func TestPartialMaterialisation(t *testing.T) {
 	if got := queryStrings(t, s, "SELECT count(*) FROM methods"); got[0] != "2" {
 		t.Fatalf("methods count = %v", got)
 	}
-	if hasTable(s, "method_calls") {
-		t.Fatalf("method_calls should not be built: %v", s.Tables())
+	if hasTable(s, "_call_sites") {
+		t.Fatalf("_call_sites should not be built: %v", s.Tables())
 	}
 	_, err := s.Query("SELECT count(*) FROM method_calls", 0)
 	if err == nil || !strings.Contains(err.Error(), "not materialised") {
@@ -87,14 +88,14 @@ func TestLazyStoreAddsTables(t *testing.T) {
 	if got := queryStrings(t, s, "SELECT count(*) FROM methods"); got[0] != "2" {
 		t.Fatalf("methods count = %v", got)
 	}
-	if !hasTable(s, "methods") || hasTable(s, "method_calls") {
+	if !hasTable(s, "methods") || hasTable(s, "_call_sites") {
 		t.Fatalf("after first query built = %v", s.Tables())
 	}
 	if got := queryStrings(t, s, "SELECT count(*) FROM method_calls"); got[0] != "1" {
 		t.Fatalf("method_calls count = %v", got)
 	}
-	if !hasTable(s, "method_calls") {
-		t.Fatalf("method_calls not added: %v", s.Tables())
+	if !hasTable(s, "_call_sites") {
+		t.Fatalf("_call_sites not added: %v", s.Tables())
 	}
 	// A second query over the same tables must not duplicate rows.
 	if got := queryStrings(t, s, "SELECT count(*) FROM methods"); got[0] != "2" {
@@ -102,30 +103,40 @@ func TestLazyStoreAddsTables(t *testing.T) {
 	}
 }
 
-func TestCacheSubkey(t *testing.T) {
+// One input gets one catalog file. A later query that reads a table the file
+// lacks must grow that file, not start a second copy: keying by table set left
+// a single 11 MB APK at 490 MB of cache.
+func TestCacheGrowsInPlace(t *testing.T) {
 	dir := t.TempDir()
-	base := store.Options{CacheDir: dir, CacheKey: "test-base"}
-	// Build the profile default, then ask for a subset of it: the subset must
-	// be served from that catalog.
-	// Build the profile default first.
-	openWith(t, base)
-	s, _ := openWith(t, store.Options{CacheDir: dir, CacheKey: "test-base", Tables: []string{"methods"}})
-	if !s.Cached {
-		t.Fatalf("subset of the default plan should reuse the full catalog")
+	openWith(t, store.Options{CacheDir: dir, CacheKey: "c", Tables: []string{"methods"}})
+
+	s, _ := openWith(t, store.Options{CacheDir: dir, CacheKey: "c",
+		Tables: []string{"methods", "_call_sites"}})
+	if s.Cached {
+		t.Fatalf("a grown catalog reports the tables it built, not a plain hit")
 	}
-	// A derived table is not part of a fast default, so it must be built into
-	// its own catalog rather than read as an empty table.
-	s2, _ := openWith(t, store.Options{CacheDir: dir, CacheKey: "test-base", Tables: []string{"method_refs"}})
-	if s2.Cached {
-		t.Fatalf("method_refs must not reuse the fast default catalog")
+	ents, err := cache.List(dir)
+	if err != nil {
+		t.Fatalf("list: %v", err)
 	}
-	if got := queryStrings(t, s2, "SELECT count(*) FROM method_refs"); got[0] == "0" {
-		t.Fatalf("method_refs rows = %v", got)
+	if len(ents) != 1 {
+		t.Fatalf("cache should hold one catalog, got %d: %v", len(ents), ents)
 	}
-	// The partial catalog is keyed by its table set and is reusable.
-	s3, _ := openWith(t, store.Options{CacheDir: dir, CacheKey: "test-base", Tables: []string{"method_refs"}})
-	if !s3.Cached {
-		t.Fatalf("partial catalog should be reused for the same table set")
+	if got := queryStrings(t, s, "SELECT count(*) FROM method_calls"); got[0] != "1" {
+		t.Fatalf("method_calls rows after grow = %v", got)
+	}
+	// The tables the first query paid for are still there.
+	if got := queryStrings(t, s, "SELECT count(*) FROM methods"); got[0] != "2" {
+		t.Fatalf("methods rows after grow = %v", got)
+	}
+
+	s2, _ := openWith(t, store.Options{CacheDir: dir, CacheKey: "c",
+		Tables: []string{"methods", "_call_sites"}})
+	if !s2.Cached {
+		t.Fatalf("the grown catalog should answer the same plan from disk")
+	}
+	if got := queryStrings(t, s2, "SELECT count(*) FROM method_calls"); got[0] != "1" {
+		t.Fatalf("method_calls rows from disk = %v", got)
 	}
 }
 

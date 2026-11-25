@@ -20,6 +20,14 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+      # The engine hands one *dex.Container to several goroutines and serves
+      # concurrent HTTP requests; a race here would be invisible to go test.
+      - name: Race detector
+        run: go test -race ./internal/store ./internal/api ./internal/mcp
+      # The parser reads attacker-controlled counts. A one-minute run caught an
+      # allocation bomb within the first few thousand executions.
+      - name: Fuzz the parser
+        run: go test ./internal/dex -run=^$ -fuzz=FuzzParseContainer -fuzztime=60s
 
   # The engine is pure Go, so every target compiles on one Linux runner.
   cross:

@@ -10,7 +10,7 @@
 #   OUT=/tmp/out scripts/build-all.sh    override the output directory
 set -euo pipefail
 
-VERSION="${VERSION:-0.4.0}"
+VERSION="${VERSION:-1.0.0}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${OUT:-$ROOT/dist/dexsql-tree-$VERSION}"
 LDFLAGS="-s -w -X github.com/byusi-studio/dexsql-tree/internal/api.Version=$VERSION"
@@ -50,6 +50,18 @@ done
 # Sample input so the archive can be smoke-tested without an APK at hand.
 go run ./cmd/dexgen -out "$OUT/demo" >/dev/null
 echo "demo: $(ls "$OUT/demo" | tr '\n' ' ')"
+
+# The Java artefacts used to be copied by hand after every release, which is
+# exactly the step that gets forgotten. Build them here or say why not.
+if command -v mvn >/dev/null 2>&1; then
+  echo "==> java client and GUI"
+  ( cd "$ROOT/java" && mvn -B -q -DskipTests package )
+  mkdir -p "$OUT/java"
+  cp "$ROOT/java/dexsql-tree-client/target/dexsql-tree-client-$VERSION.jar" "$OUT/java/"
+  cp "$ROOT/java/dexsql-tree-gui/target/dexsql-tree-gui-$VERSION.jar" "$OUT/java/"
+else
+  echo "==> mvn not found: skipping the Java client and GUI (install Maven to include them)"
+fi
 
 cp docs/release-notes-"$VERSION".md "$OUT/RELEASE-NOTES.md" 2>/dev/null || true
 cat > "$OUT/BUILD.md" <<EOF
@@ -93,7 +105,7 @@ Chinese prompts: set \`DEXSQL_TREE_ZH=true\`, or run
 \`dexsql-tree lang set zh --write\` once to persist it in your shell profile.
 EOF
 
-( cd "$OUT" && find . -type f \( -name 'dexsql-tree*' -o -name 'demo.apk' -o -name 'demo.dex' \) -print0 \
+( cd "$OUT" && find . -type f \( -name 'dexsql-tree*' -o -name 'demo.apk' -o -name 'demo.dex' -o -name '*.jar' \) -print0 \
     | sort -z | xargs -0 sha256sum > sha256sums.txt )
 
 echo

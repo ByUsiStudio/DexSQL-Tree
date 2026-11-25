@@ -13,14 +13,15 @@ func TestTablesForSQL(t *testing.T) {
 		resolved bool
 	}{
 		{"SELECT * FROM methods", []string{"methods"}, true},
-		{"select count(*) from METHOD_CALLS", []string{"method_calls"}, true},
+		// method_calls is a view over the index-only table plus methods.
+		{"select count(*) from METHOD_CALLS", []string{"_call_sites", "methods"}, true},
 		{"SELECT m.name FROM methods m JOIN types t ON t.descriptor = m.class_descriptor",
 			[]string{"methods", "types"}, true},
 		// A view expands to the base tables its DDL reads.
 		{"SELECT * FROM v_methods", []string{"methods", "types"}, true},
 		{"SELECT * FROM v_overview", []string{
-			"annotations", "classes", "dex_files", "fields", "method_calls",
-			"method_strings", "methods", "strings"}, true},
+			"_call_sites", "_string_refs", "annotations", "classes", "dex_files",
+			"fields", "methods", "strings"}, true},
 		// Identifiers in comments and string literals are not relations.
 		{"SELECT 'methods' AS x", nil, false},
 		{"SELECT 1 -- from method_calls", nil, false},
@@ -58,10 +59,18 @@ func TestDefaultTablesByProfile(t *testing.T) {
 	for _, name := range store.DefaultTables(store.ProfileFast) {
 		fast[name] = true
 	}
-	for _, derived := range []string{"method_refs", "method_using_numbers", "id_items"} {
+	for _, derived := range []string{"method_refs", "id_items"} {
 		if fast[derived] {
 			t.Errorf("fast profile should skip derived table %s", derived)
 		}
+	}
+	// method_using_numbers is a view now: naming it materialises method_numbers,
+	// so the default build no longer has to write the same rows twice.
+	if fast["method_using_numbers"] {
+		t.Errorf("method_using_numbers is not a physical table")
+	}
+	if !fast["_call_sites"] {
+		t.Errorf("the index-only call table must be part of a default build")
 	}
 	if !fast["methods"] || !fast["annotations"] {
 		t.Errorf("fast profile lost a base table: %v", store.DefaultTables(store.ProfileFast))

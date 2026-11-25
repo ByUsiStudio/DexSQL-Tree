@@ -9,6 +9,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/byusi-studio/dexsql-tree/internal/api"
 	"github.com/byusi-studio/dexsql-tree/internal/cache"
 	"github.com/byusi-studio/dexsql-tree/internal/dex"
 	"github.com/byusi-studio/dexsql-tree/internal/store"
@@ -82,7 +83,7 @@ func (s *Server) Open(path string) (string, *store.Store, error) {
 	if profile == "" {
 		profile = store.ProfileFast
 	}
-	opt := store.Options{Disk: s.Disk, Profile: profile, Lazy: true}
+	opt := store.Options{Disk: s.Disk, Profile: profile, Lazy: true, Version: api.Version}
 	if s.Cache {
 		dir := s.CacheDir
 		if dir == "" {
@@ -405,7 +406,7 @@ func (s *Server) callTool(name string, raw json.RawMessage) (string, error) {
 		}
 		res, err := st.Query(a.SQL, limit)
 		if err != nil {
-			return "", err
+			return "", store.Suggest(err)
 		}
 		return jsonText(res)
 	case "call_tree":
@@ -481,7 +482,7 @@ func (s *Server) callTool(name string, raw json.RawMessage) (string, error) {
 		}
 		res, err := st.Query(sqlText, limit)
 		if err != nil {
-			return "", err
+			return "", store.Suggest(err)
 		}
 		return jsonText(map[string]any{"recipe": rec.Name, "sql": sqlText, "result": res})
 	case "list_recipes":

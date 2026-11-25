@@ -13,7 +13,7 @@
   │                                        → 注解目录 / encoded_value
   │                                        → debug_info 状态机
   │
-  ├─ store.Open                           建 56 张表 → 单事务批量插入 → 建索引 → 建 3 个视图 → query_only=ON
+  ├─ store.Open                           按计划建表 → 单事务批量插入 → 按需建索引 → 建 8 个视图 → query_only=ON
   │
   ├─ tree.BuildGraph                      按方法描述符聚合调用边（含调用点计数）
   │
@@ -87,8 +87,16 @@ SQLite 的虚拟表接口需要 CGO 或自写 VFS，而纯 Go 驱动 `modernc.or
 
 - 目录集中在 `internal/store/schema.go`，`tables` 命令、HTTP `/api/tables`、MCP `list_tables` 与建表 DDL 共用同一份定义，不会漂移。
 - 所有标识符在建表时加双引号，因此 `method_refs."index"` 可以存在（查询时也必须加引号）。
-- 写入使用单事务 + 每表一条预编译语句；顺序为：文件元数据 → 字符串/类型 → proto/field/method → class → code/字节码 → 注解 → 调试信息 → 布局。
-- 索引在数据写完后创建，避免插入时维护 B 树。
+- 写入使用单事务 + 每表 8 行定宽批量 `INSERT`；顺序为：文件元数据 → 字符串/类型 → proto/field/method → class → code/字节码 → 注解 → 调试信息 → 布局。每个阶段只在计划要求它的表时才运行。
+- 索引在数据写完后创建，避免插入时维护 B 树；只建与"这次真正物化的表"相关的索引（`idx_methods_key` 只在某个 `*_calls` 视图要用时才建）。
+
+### 3.2.1 引用表与视图
+
+`method_calls`、`method_field_accesses`、`method_used_types`、`method_strings` 的列与 0.x 完全一致，但底层是四张只存整数索引的内部表（`_call_sites` 等），公开名字是 join `methods`/`fields`/`types`/`strings` 的视图。
+
+理由很直接：一条调用指令会在每一行重复 caller 的 descriptor，K-9 的 32.7 万行里有 104 MB 这样的重复文本。改用索引后目录从 182 MB 降到 86 MB，时间不变——省下的写放大被"查询时还要物化 methods"抵消。
+
+视图必须是**简单视图**（无聚合/`DISTINCT`/`LIMIT`），SQLite 才会把它展开进外查询，让 `WHERE callee = ?` 下推到底表并用上索引。因此 caller 列写成裸的 `m.descriptor` 而不是 `COALESCE(m.descriptor, '')`：包一层函数，索引就用不上了。`_call_sites.callee` 保留一列 descriptor，正是为了让"谁调用了 X"这个最热的问题不需要先扫 `methods`。
 
 ### 3.3 只读保护
 

@@ -43,7 +43,7 @@ LSPosed 的 [DexSQL](https://github.com/LSPosed/dexsql-release) 证明了"DEX �
 flowchart LR
     subgraph Go["Go 引擎（单二进制）"]
         A["APK / DEX / JAR"] --> B["internal/dex<br/>DEX 解析 + 指令解码 + smali"]
-        B --> C["internal/store<br/>56 张关系表 / SQLite 物化"]
+        B --> C["internal/store<br/>51 张表 + 8 个视图 / SQLite 物化"]
         C --> D["CLI<br/>query · tables · smali"]
         C --> E["HTTP API<br/>/api/query · /api/tree"]
         B --> F["internal/tree<br/>调用图 + 环检测"]
@@ -97,6 +97,21 @@ Ljava/io/PrintStream;->println(Ljava/lang/String;)V  NULL
 ```
 
 `NULL` 的含义是这个 DEX 只**引用**了该方法，没有定义它。这也是 DexSQL 数据模型里"引用 vs 定义"的核心区分。
+
+### 3.1.1 不想先读文档
+
+```bash
+./bin/dexsql-tree start --input app.apk
+```
+
+一条命令打印包的规模，然后依次问三个任何 APK 都值得问的问题：哪个类的方法最多、字符串里有没有写死的地址、入口方法在哪。每条结果下面给一行可直接复制的命令。K-9 上约 1.3 秒，因为它只物化这三个问题读到的表。
+
+拼错表名或列名时，错误会带上最近邻：
+
+```
+error: SQL logic error: no such table: method_call (1)
+did you mean "method_calls"? run `dexsql-tree tables` for the full list
+```
 
 ### 支持的平台
 
@@ -159,7 +174,7 @@ mvn -pl dexsql-tree-gui javafx:run -Ddexsql.args="--connect http://127.0.0.1:876
 | `search --input X --keyword 关键词` | 一次搜类、方法、字段、字符串；`--kind` 可限定范围；直接扫模型，不建 SQLite |
 | `stats --input X [--json]` | 一屏总览：文件、类、方法、调用点、最大的类 |
 | `recipes [名称]` | 列出内置模板，给名称时打印 SQL 与参数 |
-| `tables [--json]` | 列出 56 张表与 3 个便捷视图 |
+| `tables [--json]` | 列出 51 张表与 8 个视图（内部表不展示） |
 | `tree --input X --method D` | 调用树；`--direction callers\|callees`、`--depth`、`--format text\|json\|dot` |
 | `smali --input X --method D` | 反汇编单个方法 |
 | `serve --input X [--addr ...]` | HTTP API + Web UI |
@@ -244,20 +259,35 @@ dexsql-tree cache clear         # 全部删掉
 
 ### 只物化要查的表
 
-0.4.0 起，打开时不再写满 56 张表。引擎先从 SQL 里做一次词法扫描（跳过注释、字符串字面量与不认识的标识符），把视图展开成基表，然后只建这几张：
+0.4.0 起，打开时不再写满全部 51 张表。引擎先从 SQL 里做一次词法扫描（跳过注释、字符串字面量与不认识的标识符），把视图展开成基表，然后只建这几张：
 
 ```bash
 dexsql-tree query --input app.apk --sql "SELECT count(*) FROM method_calls"
-# 0.4.0：K-9 上 2.6 s / 556 MB；0.3.0 同一条查询 11.2 s / 1.34 GB
+# 1.0.0：K-9 上 2.66 s / 389 MB，目录 86 MB；0.3.0 同一条查询 11.2 s / 1.34 GB
 ```
 
 边界与代价：
 
 - 计划是**词法**的，不是 SQL 解析器。CTE 或别名撞上表名只会多建一张，不会漏；语句里没有任何表名时（`SELECT 1`）什么也不建，由 SQLite 报 `no such table`，不会静默返回 0 行。
-- 目录是为**一组表**建的，所以缓存键包含表集合。已有的完整目录可以回答它的任何子集查询；反过来，只建了两张表的目录不会被拿去回答五张表的查询。
+- 一个输入只有**一份**目录。后一次查询读到新表时，引擎复制现有文件、补建缺的那几张、再原子替换；前一次查询付过的表不会被重写，也不会多出一个文件。
 - 需要绕过计划（交互式随便查、调试）时加 `--all-tables`。
-- `fast` 档默认跳过三张派生表：`method_refs` 是其余引用表的超集，`method_using_numbers` 与 `method_numbers` 重复，`id_items` 只有取证级查询用。语句点名它们时仍会构建，因此不会出现"查到 0 行"的静默错误。
-- 表达式里的 `SELECT *` 不需要特殊处理：`FROM` 后面的基表一定会被识别，星号只影响列，不影响表。
+- `fast` 档默认跳过两张派生表：`method_refs` 是其余引用表的超集，`id_items` 只有取证级查询用。语句点名它们时仍会构建，因此不会出现"查到 0 行"的静默错误。
+
+### 引用表是视图
+
+`method_calls`、`method_field_accesses`、`method_used_types`、`method_strings` 看起来和普通表一样，`SELECT *` 的列也与之前完全相同，但底层已经不再是"每行抄一遍 caller 的 descriptor"。一条调用指令重复存 caller 的 `Lcom/x/Y;->z(...)V`，在 K-9 上就是 64 MB 重复文本、190 MB 目录。
+
+现在只有四张内部表（`_call_sites`、`_field_accesses`、`_used_types`、`_string_refs`）存整数索引，公开名字是 join `methods` / `fields` / `types` / `strings` 的视图：
+
+```sql
+SELECT method, callee FROM method_calls WHERE callee = 'Lcom/x/Foo;->bar(I)V'
+-- 计划：SEARCH _call_sites USING INDEX idx_call_sites_callee，再按索引取 methods
+```
+
+两点要知道：
+
+- 按 caller 过滤（`WHERE method = ...`）现在要 join `methods`，比按 callee 过滤多一次全表匹配；`tree` 与 `recipes callers` 走的就是索引路径。
+- `SELECT count(*) FROM method_calls` 会真的 join，K-9 上 0.42 s、VLC 上 0.95 s。只想知道规模时用 `SELECT * FROM v_overview`，它数的是底表，几毫秒。
 
 两个开关控制"打开时做什么"：
 
@@ -409,7 +439,7 @@ dexsql-tree/
 │   └── dexgen/            生成演示 DEX/APK
 ├── internal/
 │   ├── dex/               DEX 解析、指令解码、debug_info、注解、smali、APK 读取
-│   ├── store/             SQLite 物化、56 张表、视图、查询模板、只读守卫
+│   ├── store/             SQLite 物化、51 张表、8 个视图、查询模板、只读守卫
 │   ├── cache/             磁盘目录缓存（键、列表、清理、残留回收）
 │   ├── tree/              调用图、树构建、环检测、DOT 输出
 │   ├── api/               HTTP API 与内置 Playground
@@ -433,7 +463,7 @@ dexsql-tree/
 
 - DEX 035–041 常用节：字符串池、type/proto/field/method id、class_def、class_data、code_item、try/catch、debug_info、注解目录与编码值、method_handle、call_site、map_list、encoded_array、hiddenapi 标志表。DEX 041 容器会拆成多个逻辑 DEX（`classes.dex#2`），`file_id` 保持稳定。
 - MUTF-8 解码（含 U+0000 与代理对）、Java 风格类型名、Dalvik 指令长度与引用提取、常量提取、smali 文本。
-- 56 张关系表，覆盖实体、引用、字节码、注解、调试信息、隐藏 API 与 DEX 结构；另有 `v_methods`、`v_fields`、`v_overview` 三个便捷视图。
+- 51 张表与 8 个视图，覆盖实体、引用、字节码、注解、调试信息、隐藏 API 与 DEX 结构。五张引用关系是视图，列与历史上的表一致，底层只存索引。
 - 8 个内置查询模板（调用者、被调用者、API 使用量、最大方法、疑似凭据字符串等），CLI/HTTP/MCP 共用。
 - 调用图（按调用点计数）与带环检测的树视图。
 - 中英双语 CLI（`DEXSQL_TREE_ZH`）、关键词搜索与一屏统计。
@@ -445,50 +475,56 @@ dexsql-tree/
 
 **性能（Linux x64，`--profile fast`，冷启动，无 `--cache`）**
 
-0.3.0 的每一行都是"打开即写满"，所以同一份样本上任何查询都是一个数；0.4.0 的数字取决于查询读到哪几张表。
+1.0.0 的数字取决于查询读到哪几张表。两个样本在同一台机器、同一轮里与 0.4.0 并排跑，取较小值：
 
-| 样本 | 体积 | 方法数 | 0.3.0 任意查询 | 0.4.0 `methods` | 0.4.0 `method_calls` |
+| 样本 | 体积 | 方法数 | `methods` | `method_calls` | 目录大小 |
 | --- | ---: | ---: | --- | --- | --- |
-| F-Droid `com.fsck.k9` | 11 MB | 64,586 | 11.7 s / 1.34 GB | **0.79 s / 282 MB** | **2.6 s / 556 MB** |
-| F-Droid `org.videolan.vlc` | 46 MB | 270,153 | 31.8 s / 3.52 GB | **2.34 s / 1.07 GB** | **5.7 s / 1.69 GB** |
+| F-Droid `com.fsck.k9` | 11 MB | 64,586 | 0.91 s / 277 MB | 2.66 s / 389 MB | 24 MB / 86 MB |
+| F-Droid `org.videolan.vlc` | 46 MB | 270,153 | 2.50 s / 1.07 GB | 7.06 s / 1.23 GB | 92 MB / 239 MB |
 
-`SELECT 1` 在 K-9 上 0.36 s / 207 MB：只解析、不建表。全量（`--all-tables`）仍是 10.4 s / 927 MB，比 0.3.0 快 11%，来自索引精简、16 KiB 页与写入路径。`--cache` 命中的数字不变（亚秒级）。
+与 0.4.0 并排（时间 / 峰值 RSS / 目录）：
 
-0.3.0 时期的单项收益（保留作对照）：
+| 查询 | 0.4.0 | 1.0.0 | 变化 |
+| --- | --- | --- | --- |
+| K-9 `method_calls` | 2.80 s / 454 MB / 182 MB | 2.66 s / 389 MB / 86 MB | 时间 -5%，磁盘 -53% |
+| VLC `method_calls` | 7.07 s / 1.22 GB / 398 MB | 7.06 s / 1.23 GB / 239 MB | 时间持平，磁盘 -40% |
+| K-9 `methods` | 0.93 s / 310 MB / 24 MB | 0.91 s / 277 MB / 24 MB | 持平 |
+| VLC `methods` | 3.17 s / 1.14 GB / 88 MB | 2.50 s / 1.07 GB / 92 MB | 时间 -21% |
 
-| 改动 | 效果 |
-| --- | --- |
-| 8 行定宽批量插入 | 16.7 s → 11.6 s（-30%）。批次更大反而变慢：每个绑定参数有一次反射开销 |
-| `--profile fast` 跳过注解表 | VLC 39.4 s → 32.7 s（-17%） |
-| 多 DEX 并行解析（6 dex） | 33.3 s → 30.9 s（-7%）；解析只占小包总时间的 3–5% |
-| `--cache` | 12.0 s → 0.44 s（25 倍以上） |
+这一版的收益主要不在时间，而在**同样的结果只占一半磁盘**：引用表不再逐行重复 descriptor。多出来的成本是 `method_calls` 查询现在要连带物化 `methods` 以完成 join，与省下的写放大基本抵消。
 
-0.4.0 的增量：
+`SELECT 1` 在 K-9 上 0.36 s / 207 MB：只解析、不建表。全量（`--all-tables`）仍是 10.4 s / 927 MB。`--cache` 命中的 `methods` 是 0.3 s 级；命中后仍要解析 DEX（调用树与 smali 依赖内存模型）。
 
-| 改动 | 效果 |
-| --- | --- |
-| 按需物化 | K-9 `methods` 11.7 s → 0.79 s（14.8 倍）；VLC `methods` 31.8 s → 2.34 s（13.6 倍） |
-| 精简索引（只留等值匹配的 6 个） | 全量 K-9 11.7 s → 10.4 s（-11%），库文件少 18 MB 量级 |
-| `page_size=16384` | 同数据 2.90 s → 2.68 s，文件 195.8 MB → 190.1 MB（K-9 `method_calls` 目录） |
-| 热点表改用可复用 `[]any` | 单阶段写入 1.54 s → 1.37 s（-11%） |
-| 物化后释放模型 | `query` 子命令峰值 RSS 约降 1/4 |
+历史增量（0.3.0 / 0.4.0，保留作对照）：
 
-行号表（`--debug`）现在也按需：不查 `debug_positions` 就不会写。K-9 有 725 万条 position，只有语句点名调试表时才付这份代价。
+| 版本 | 改动 | 效果 |
+| --- | --- | --- |
+| 0.3.0 | 8 行定宽批量插入 | 16.7 s → 11.6 s（-30%）。批次更大反而变慢 |
+| 0.3.0 | `--profile fast` 跳过注解表 | VLC 39.4 s → 32.7 s（-17%） |
+| 0.3.0 | 多 DEX 并行解析（6 dex） | 33.3 s → 30.9 s（-7%） |
+| 0.3.0 | `--cache` | 12.0 s → 0.44 s（25 倍以上） |
+| 0.4.0 | 按需物化 | K-9 `methods` 11.7 s → 0.79 s（14.8 倍） |
+| 0.4.0 | 精简索引 + `page_size=16384` | 全量 K-9 11.7 s → 10.4 s |
+| 0.4.0 | 物化后释放模型 | `query` 峰值 RSS 约降 1/4 |
+
+行号表（`--debug`）仍是单独开销，但已经按需：不查 `debug_positions` 就不会写。K-9 有 725 万条 position。
 
 **当前限制（请按需评估）**
 
-1. **单表仍然线性**：按需物化解决的是"写太多表"，不是"单表太大"。读 `method_calls` 仍要把 30 万级调用点写进 SQLite，VLC 上约 5.7 s / 1.69 GB。再往下需要列式布局或流式执行器，那是另一个量级的工程。
-2. **全量场景没有变快一个数量级**：`--all-tables` 或 `--profile full` + 大范围查询仍在 10–30 s；这是刻意保留的逃生口，不是默认路径。
-3. **`hiddenapi_flags` 是保守解析**：按 class_defs 顺序读 uleb128，遇到越界即停止并记 warning；测试覆盖了截断与非法长度，但未在大量商业包上做过统计校验。
-4. **大样本以开源 APK 验证**：已覆盖 6 个 DEX、39 MB 的 VLC，但未做商业加固/混淆包的基准。
-5. **JavaFX 桌面端未在真实显示器上做交互回归**：分页、取消、内联报错的逻辑有编译与端到端验证，但没有在物理显示器上逐项点过。
-6. SQLite 关键字冲突：`method_refs."index"` 需要引号。
+1. **单表仍然线性**：按需物化解决的是"写太多表"，不是"单表太大"。读 `method_calls` 仍要把百万级调用点写进 SQLite，VLC 上约 7 s / 1.2 GB。再往下需要列式布局或流式执行器，那是另一个量级的工程。
+2. **视图 join 有固定成本**：`count(*) FROM method_calls` 要真的 join，K-9 0.42 s、VLC 0.95 s；按 caller（而不是 callee）过滤也一样。
+3. **全量场景没有变快一个数量级**：`--all-tables` 或 `--profile full` + 大范围查询仍在 10–30 s；这是刻意保留的逃生口，不是默认路径。
+4. **`hiddenapi_flags` 是保守解析**：按 class_defs 顺序读 uleb128，遇到越界即停止并记 warning；测试覆盖了截断与非法长度，但未在大量商业包上做过统计校验。
+5. **大样本以开源 APK 验证**：已覆盖 6 个 DEX、39 MB 的 VLC，但未做商业加固/混淆包的基准。
+6. **JavaFX 桌面端未在真实显示器上做交互回归**：分页、取消、内联报错的逻辑有编译与端到端验证，但没有在物理显示器上逐项点过。
+7. SQLite 关键字冲突：`method_refs."index"` 需要引号。
 
 **路线图**
 
-- **新手体验**（下一版重点，见 [docs/roadmap-0.5.0.md](docs/roadmap-0.5.0.md)）：`start` 子命令、任务导向模板、错误附带建议、GUI 示例卡片
+- **GUI 示例卡片与任务导向模板**（下一版，见 [docs/roadmap-0.6.0.md](docs/roadmap-0.6.0.md)）：空状态可点击示例、`find-urls` / `find-secrets` 等模板
 - 注解按需：`full` 档也只在语句引用注解表时展开
 - `debug_positions` 打包：一个方法一行 + varint 二进制块，把 725 万行降到 6.8 万行（`--debug` 专用）
+- `serve` 并发读：当前每个目录一个只读连接，长查询会排队
 - 覆盖方法/字段的 override 关系展开（当前只按字节码直接引用）
 - 模板与视图继续扩充（xref 汇总、签名对比）
 - JavaFX：SQL 语法高亮、结果导出 CSV、深色/浅色主题切换

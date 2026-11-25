@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,6 +30,7 @@ type Store struct {
 	Cached bool
 	// Profile records which materialisation profile produced the catalog.
 	Profile Profile
+	version string
 	path    string
 
 	// built records which tables hold data. A table can exist and be empty —
@@ -87,6 +89,10 @@ type Options struct {
 	// query first touches them. It is meant for long-lived HTTP/MCP servers,
 	// where the statements are not known at open time.
 	Lazy bool
+	// Version is stamped into the catalog so `cache prune` can tell a catalog
+	// this build understands from one left behind by an older release. Cached
+	// keys already include the version; this covers files renamed or copied.
+	Version string
 }
 
 // Open materialises an already-loaded container into a read-only SQLite view.
@@ -115,58 +121,56 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 		// Nothing is built until a statement names it.
 		p = newPlan([]string{}, profile)
 	}
-	defaultPlan := p.need == nil || sameStrings(p.names, DefaultTables(profile))
 
-	baseKey := opt.CacheKey
+	// The cache holds one catalog per input, not one per table set. An earlier
+	// query may have built two tables; a later one grows the same file instead
+	// of starting a second copy, which kept a single 11 MB APK at 490 MB of
+	// cache. A statement that reads nothing (SELECT 1) writes nothing at all.
+	key := opt.CacheKey
+	if key != "" && opt.CacheDir == "" {
+		key = ""
+	}
+	if key != "" && !opt.Lazy && p.need != nil && len(p.names) == 0 {
+		// Nothing to materialise: SELECT 1 and friends must not leave an empty
+		// catalog behind. A lazy open is a different thing — its empty plan
+		// means "build later", so it may still mount a complete catalog.
+		key = ""
+	}
 	if opt.Lazy && profile != ProfileFull {
 		// A lazily opened catalog may be asked for any table later, and a
-		// read-only cache file cannot grow. A fast catalog leaves the derived
-		// tables out, so mounting it would turn a legal query into an error;
-		// only a full catalog covers everything a server can ask for.
-		baseKey = ""
+		// read-only cache file cannot grow. A fast catalog also leaves the
+		// derived tables out, so mounting it would turn a legal query into an
+		// error; only a full catalog covers everything a server can ask for.
+		key = ""
 	}
-	key := baseKey
-	if !defaultPlan && key != "" && !opt.Lazy {
-		if len(p.names) == 0 {
-			// Nothing to materialise: SELECT 1 and friends must not leave an
-			// empty catalog behind.
-			key = ""
-		} else {
-			key = cache.Subkey(baseKey, p.names)
-		}
-	}
+
 	cachePath := ""
-	if opt.CacheDir != "" && key != "" {
-		// A catalog built from the profile default answers every subset of it,
-		// so a restricted query looks there first. Derived tables are the
-		// exception: a fast default leaves them empty, so a statement naming
-		// method_refs must not be served from it.
-		candidates := []string{key}
-		if !defaultPlan && subsetOfDefault(p.names, profile) && baseKey != "" {
-			candidates = append([]string{baseKey}, candidates...)
-		}
-		seen := map[string]bool{}
-		for _, k := range candidates {
-			if k == "" || seen[k] {
-				continue
+	seedPath := ""
+	if key != "" {
+		path := cache.Path(opt.CacheDir, key)
+		if _, ok := cache.Stat(opt.CacheDir, key); ok {
+			st, missing, err := probe(c, path, profile, p)
+			switch {
+			case err != nil:
+				// A half-written or foreign file must not be served twice.
+				os.Remove(path)
+			case len(missing) == 0:
+				return st, nil
+			default:
+				// The catalog exists but lacks tables this statement reads.
+				// Grow it in place: rebuilding would throw away the tables the
+				// previous query already paid for, which is what made a cache
+				// for one APK cost several hundred megabytes.
+				st.DB.Close()
+				seedPath = path
+				p = newPlan(missing, profile)
 			}
-			seen[k] = true
-			if _, ok := cache.Stat(opt.CacheDir, k); !ok {
-				continue
-			}
-			path := cache.Path(opt.CacheDir, k)
-			if s, err := openReadOnly(c, path, profile, p, true); err == nil {
-				return s, nil
-			}
-			// A half-written, corrupt or wrongly-keyed catalog must not be
-			// served twice.
-			os.Remove(path)
 		}
 		if err := cache.Ensure(opt.CacheDir); err != nil {
 			return nil, err
 		}
 		cache.CleanStale(opt.CacheDir, time.Hour)
-		cachePath = cache.Path(opt.CacheDir, key)
+		cachePath = path
 	}
 	if opt.Lazy {
 		// A server query arrives after open, so its table set has no stable
@@ -179,6 +183,14 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 	writePath := ""
 	if cachePath != "" {
 		writePath = fmt.Sprintf("%s.tmp%d", cachePath, os.Getpid())
+		if seedPath != "" {
+			// Copy first, then publish by rename: readers keep the old file
+			// (and its consistent table set) until the new one is complete.
+			if err := copyFile(seedPath, writePath); err != nil {
+				os.Remove(writePath)
+				return nil, err
+			}
+		}
 		tmpPath = writePath
 		dsn = "file:" + filepath.ToSlash(writePath) + "?mode=rwc"
 	} else if opt.Disk {
@@ -197,7 +209,7 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 	db.SetMaxIdleConns(1)
 	s := &Store{
 		DB: db, Container: c, Stats: c.Stats(), Warnings: append([]string{}, c.Warnings...),
-		path: tmpPath, Profile: profile, lazy: opt.Lazy, built: map[string]bool{},
+		path: tmpPath, Profile: profile, version: opt.Version, lazy: opt.Lazy, built: map[string]bool{},
 	}
 	fail := func(err error) (*Store, error) {
 		db.Close()
@@ -236,6 +248,14 @@ func Open(c *dex.Container, opts ...Options) (*Store, error) {
 	}
 	if _, err := db.Exec(metaDDL); err != nil {
 		return fail(fmt.Errorf("meta: %w", err))
+	}
+	if seedPath != "" {
+		// The copied catalog already holds some tables. Loading their names
+		// keeps the writer from rebuilding them and makes _meta describe the
+		// union after the grow.
+		if err := s.readMeta(nil); err != nil {
+			return fail(fmt.Errorf("seed meta: %w", err))
+		}
 	}
 	if err := s.load(profile, p); err != nil {
 		return fail(err)
@@ -285,24 +305,23 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
-// openReadOnly mounts an existing catalog. The container is still parsed by the
-// caller, so call trees and smali keep working; only materialisation is skipped.
+// probe mounts an existing catalog and reports which of the plan's tables it
+// does not hold yet. The caller decides whether to grow the file or discard it.
 //
-// A restricted plan is only served when the file actually contains every table
-// it needs; otherwise the caller rebuilds, because a missing table would turn
-// "no rows" into a wrong answer instead of an error.
-func openReadOnly(c *dex.Container, path string, profile Profile, p plan, cached bool) (*Store, error) {
+// The container is still parsed by the caller, so call trees and smali keep
+// working; only materialisation is skipped when the file is complete.
+func probe(c *dex.Container, path string, profile Profile, p plan) (*Store, []string, error) {
 	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&cache=private"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	for _, pragma := range []string{"PRAGMA cache_size=-65536", "PRAGMA temp_store=FILE", "PRAGMA query_only=ON"} {
 		if _, err := db.Exec(pragma); err != nil {
 			db.Close()
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	// A short or foreign file is opened by SQLite as an empty database, so the
@@ -311,26 +330,57 @@ func openReadOnly(c *dex.Container, path string, profile Profile, p plan, cached
 	if err := db.QueryRow(
 		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='methods'`).Scan(&n); err != nil || n == 0 {
 		db.Close()
-		return nil, fmt.Errorf("catalog %s is not usable", path)
+		return nil, nil, fmt.Errorf("catalog %s is not usable", path)
 	}
 	s := &Store{
 		DB:        db,
 		Container: c,
 		Stats:     c.Stats(),
 		Warnings:  append([]string{}, c.Warnings...),
-		Cached:    cached,
+		Cached:    true,
 		Profile:   profile,
 		built:     map[string]bool{},
 	}
 	if err := s.readMeta(DefaultTables(profile)); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("catalog %s is not usable: %w", path, err)
+		return nil, nil, fmt.Errorf("catalog %s is not usable: %w", path, err)
 	}
 	if missing := p.missing(s.built); len(missing) > 0 {
-		db.Close()
+		return s, missing, nil
+	}
+	return s, nil, nil
+}
+
+// openReadOnly mounts a catalog that is known to be complete for p.
+func openReadOnly(c *dex.Container, path string, profile Profile, p plan, cached bool) (*Store, error) {
+	s, missing, err := probe(c, path, profile, p)
+	if err != nil {
+		return nil, err
+	}
+	if len(missing) > 0 {
+		s.DB.Close()
 		return nil, fmt.Errorf("catalog %s lacks %s", path, strings.Join(missing, ", "))
 	}
+	s.Cached = cached
 	return s, nil
+}
+
+// copyFile seeds a writable catalog from the one already on disk.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // Close releases the database and removes the temporary file, if any.
@@ -502,7 +552,7 @@ func (s *Store) load(profile Profile, p plan) error {
 	}
 	tIdx := time.Now()
 	for _, idx := range indexDDL {
-		if !p.wants(idx.table) {
+		if !indexWanted(idx, built) {
 			continue
 		}
 		if _, err := s.DB.Exec(idx.sql); err != nil {
@@ -517,23 +567,52 @@ func (s *Store) load(profile Profile, p plan) error {
 }
 
 // indexDef ties an index to the table it accelerates, so a restricted build
-// creates only the indexes it can use.
+// creates only the indexes it can use. needs lists the relations that make the
+// index worth building: an index on methods(file_id, method_idx) is dead weight
+// unless a *_calls view is being materialised, and building it costs ~0.3 s on
+// a large APK.
 type indexDef struct {
 	table string
 	sql   string
+	needs []string
 }
 
-// Only indexes that serve an equality lookup are kept. A B-tree on descriptor,
-// strings.value or method_strings.value is never used by the LIKE '%x%' queries
-// people actually run, and those three indexes alone cost ~18 MB and ~1.2 s on
-// a mid-sized APK. The remaining ones answer the join and call-site questions.
+// Only indexes that serve a lookup are kept. A B-tree on strings.value or
+// method_strings.value is never used by the LIKE '%x%' queries people actually
+// run. The list below is what the views and the common equality questions need.
 var indexDDL = []indexDef{
-	{"methods", `CREATE INDEX IF NOT EXISTS idx_methods_class ON methods(class_descriptor)`},
-	{"method_calls", `CREATE INDEX IF NOT EXISTS idx_method_calls_callee ON method_calls(callee)`},
-	{"method_calls", `CREATE INDEX IF NOT EXISTS idx_method_calls_method ON method_calls(method)`},
-	{"method_refs", `CREATE INDEX IF NOT EXISTS idx_method_refs_kind ON method_refs(index_kind, "index")`},
-	{"class_methods", `CREATE INDEX IF NOT EXISTS idx_class_methods_method ON class_methods(method_idx)`},
-	{"types", `CREATE INDEX IF NOT EXISTS idx_types_class ON types(file_id, descriptor)`},
+	{"methods", `CREATE INDEX IF NOT EXISTS idx_methods_class ON methods(class_descriptor)`, nil},
+	// Join keys for the *_calls / *_field_accesses / *_used_types / *_strings
+	// views. Without them SQLite builds a transient index per join, which is
+	// slower than not having one at all.
+	{"methods", `CREATE INDEX IF NOT EXISTS idx_methods_key ON methods(file_id, method_idx)`,
+		[]string{"_call_sites", "_field_accesses", "_used_types", "_string_refs", "method_numbers"}},
+	{"method_refs", `CREATE INDEX IF NOT EXISTS idx_method_refs_kind ON method_refs(index_kind, "index")`, nil},
+	{"class_methods", `CREATE INDEX IF NOT EXISTS idx_class_methods_method ON class_methods(method_idx)`, nil},
+	{"types", `CREATE INDEX IF NOT EXISTS idx_types_class ON types(file_id, descriptor)`, nil},
+	{"types", `CREATE INDEX IF NOT EXISTS idx_types_key ON types(file_id, type_idx)`, []string{"_used_types"}},
+	{"fields", `CREATE INDEX IF NOT EXISTS idx_fields_key ON fields(file_id, field_idx)`, []string{"_field_accesses"}},
+	{"strings", `CREATE INDEX IF NOT EXISTS idx_strings_key ON strings(string_pool_id, string_idx)`, []string{"_string_refs"}},
+	{"_call_sites", `CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON _call_sites(callee)`, nil},
+	// The other direction: "what does this method call". The view filters on
+	// methods.descriptor, so the join needs (file_id, method_idx) here or the
+	// planner falls back to scanning every call site.
+	{"_call_sites", `CREATE INDEX IF NOT EXISTS idx_call_sites_method ON _call_sites(file_id, method_idx)`, nil},
+}
+
+// indexWanted decides whether an index is worth building for this load. A table
+// that is already in the catalog still needs its join index when a view that
+// reads it is added later, which is what the grow-in-place path relies on.
+func indexWanted(idx indexDef, built map[string]bool) bool {
+	if !built[idx.table] {
+		return false
+	}
+	for _, n := range idx.needs {
+		if built[n] {
+			return true
+		}
+	}
+	return len(idx.needs) == 0
 }
 
 // step is one loader phase and the tables it fills. A phase is skipped when the
@@ -558,8 +637,8 @@ var loadSteps = []step{
 	}, (*loader).classMembers},
 	{"codeItems", []string{"code_items", "try_items", "catch_handlers"}, (*loader).codeItems},
 	{"bytecodeRefs", []string{
-		"method_refs", "method_strings", "method_calls", "method_field_accesses",
-		"method_used_types", "method_numbers", "method_using_numbers",
+		"method_refs", "_string_refs", "_call_sites", "_field_accesses",
+		"_used_types", "method_numbers",
 	}, (*loader).bytecodeRefs},
 	{"annotations", []string{
 		"annotations", "annotation_elements", "annotation_directories", "annotation_directory_entries",
@@ -623,8 +702,32 @@ func (s *Store) writeMeta(tx *sql.Tx, built map[string]bool) error {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	_, err := tx.Exec(`INSERT OR REPLACE INTO _meta(key, value) VALUES('tables', ?)`, strings.Join(names, ","))
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO _meta(key, value) VALUES('tables', ?)`,
+		strings.Join(names, ",")); err != nil {
+		return err
+	}
+	if s.version == "" {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT OR REPLACE INTO _meta(key, value) VALUES('version', ?)`, s.version)
 	return err
+}
+
+// CatalogVersion reads the engine version that wrote a catalog. An empty string
+// means the file predates version stamping, which is itself evidence of an old
+// build. A file that cannot be opened at all is reported as an error.
+func CatalogVersion(path string) (string, error) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var v string
+	err = db.QueryRow(`SELECT value FROM _meta WHERE key='version'`).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
 }
 
 func (s *Store) readMeta(fallback []string) error {

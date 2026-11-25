@@ -93,7 +93,7 @@ func (s *Server) AddJobs(path string, jobs int) (string, *store.Store, error) {
 	if profile == "" {
 		profile = store.ProfileFast
 	}
-	opt := store.Options{Disk: s.Disk, Profile: profile, Lazy: s.Lazy}
+	opt := store.Options{Disk: s.Disk, Profile: profile, Lazy: s.Lazy, Version: Version}
 	if s.Cache {
 		dir := s.CacheDir
 		if dir == "" {
@@ -168,7 +168,7 @@ func (s *Server) requireToken(h http.Handler) http.Handler {
 }
 
 // Version is reported by /api/health and the CLI.
-var Version = "0.4.0"
+var Version = "1.0.0"
 
 func cors(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -326,7 +326,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := st.Query(req.SQL, limit)
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, 400, store.Suggest(err))
 		return
 	}
 	writeJSON(w, 200, res)

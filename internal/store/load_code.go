@@ -1,9 +1,5 @@
 package store
 
-import (
-	"github.com/byusi-studio/dexsql-tree/internal/dex"
-)
-
 func (l *loader) codeItems() error {
 	for _, f := range l.s.Container.Files {
 		for mi := range f.Methods {
@@ -57,14 +53,13 @@ func boolInt(b bool) int {
 
 func (l *loader) bytecodeRefs() error {
 	refs := l.batch("method_refs")
-	calls := l.batch("method_calls")
-	strs := l.batch("method_strings")
-	fields := l.batch("method_field_accesses")
-	usedTypes := l.batch("method_used_types")
+	calls := l.batch("_call_sites")
+	strs := l.batch("_string_refs")
+	fields := l.batch("_field_accesses")
+	usedTypes := l.batch("_used_types")
 	numbers := l.batch("method_numbers")
-	usingNumbers := l.batch("method_using_numbers")
 	if refs == nil && calls == nil && strs == nil && fields == nil &&
-		usedTypes == nil && numbers == nil && usingNumbers == nil {
+		usedTypes == nil && numbers == nil {
 		return nil
 	}
 	for _, f := range l.s.Container.Files {
@@ -91,12 +86,7 @@ func (l *loader) bytecodeRefs() error {
 					if strs == nil {
 						continue
 					}
-					val := ""
-					if int(ref.Index) < len(f.Strings) {
-						val = f.Strings[ref.Index]
-					}
-					strs.rows = append(strs.rows, m.Descriptor, m.ClassDesc, m.Name, val,
-						int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index))
+					strs.rows = append(strs.rows, int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index))
 					if err := l.done(strs); err != nil {
 						return err
 					}
@@ -104,15 +94,16 @@ func (l *loader) bytecodeRefs() error {
 					if calls == nil {
 						continue
 					}
-					callee, calleeClass, calleeName := "", "", ""
+					// Only the callee descriptor is worth storing: its class and
+					// name come from the methods row the view already joins.
+					callee := ""
 					if int(ref.Index) < len(f.Methods) {
-						cm := f.Methods[ref.Index]
-						callee, calleeClass, calleeName = cm.Descriptor, cm.ClassDesc, cm.Name
+						callee = f.Methods[ref.Index].Descriptor
 					} else {
 						l.s.Warnings = append(l.s.Warnings, "method_calls: callee index out of range")
 					}
-					calls.rows = append(calls.rows, m.Descriptor, m.ClassDesc, m.Name, callee,
-						calleeClass, calleeName, int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index))
+					calls.rows = append(calls.rows, int64(f.FileID), int64(m.ClassIdx), int64(mi),
+						int64(ref.Index), callee)
 					if err := l.done(calls); err != nil {
 						return err
 					}
@@ -124,14 +115,8 @@ func (l *loader) bytecodeRefs() error {
 					if ref.UsingType != "" {
 						using = ref.UsingType
 					}
-					fld, fldClass, fldName, fldType := "", "", "", ""
-					if int(ref.Index) < len(f.Fields) {
-						fd := f.Fields[ref.Index]
-						fld, fldClass, fldName, fldType = fd.Descriptor(), fd.ClassDesc, fd.Name, fd.TypeDesc
-					}
-					fields.rows = append(fields.rows, m.Descriptor, m.ClassDesc, m.Name, fld,
-						fldClass, fldName, fldType, using, int64(f.FileID), int64(m.ClassIdx),
-						int64(mi), int64(ref.Index))
+					fields.rows = append(fields.rows, int64(f.FileID), int64(m.ClassIdx),
+						int64(mi), int64(ref.Index), using)
 					if err := l.done(fields); err != nil {
 						return err
 					}
@@ -139,39 +124,24 @@ func (l *loader) bytecodeRefs() error {
 					if usedTypes == nil {
 						continue
 					}
-					desc := ""
-					if int(ref.Index) < len(f.TypeDescs) {
-						desc = f.TypeDescs[ref.Index]
-					}
-					usedTypes.rows = append(usedTypes.rows, m.Descriptor, m.ClassDesc, m.Name, desc,
-						dex.JavaName(desc), int64(f.FileID), int64(m.ClassIdx), int64(mi), int64(ref.Index))
+					usedTypes.rows = append(usedTypes.rows, int64(f.FileID), int64(m.ClassIdx),
+						int64(mi), int64(ref.Index))
 					if err := l.done(usedTypes); err != nil {
 						return err
 					}
 				}
 			}
 			for _, n := range ci.Numbers {
-				if numbers != nil {
-					var dbl any
-					if n.HasDouble {
-						dbl = n.DoubleVal
-					}
-					numbers.rows = append(numbers.rows, int64(f.FileID), int64(m.ClassIdx), int64(mi),
-						int64(n.Opcode), n.NumberType, n.LongValue, dbl)
-					if err := l.done(numbers); err != nil {
-						return err
-					}
-				}
-				if usingNumbers == nil {
+				if numbers == nil {
 					continue
 				}
 				var dbl any
 				if n.HasDouble {
 					dbl = n.DoubleVal
 				}
-				usingNumbers.rows = append(usingNumbers.rows, m.Descriptor, m.ClassDesc, m.Name, n.NumberType,
-					n.LongValue, dbl, int64(n.Opcode), int64(f.FileID), int64(m.ClassIdx), int64(mi))
-				if err := l.done(usingNumbers); err != nil {
+				numbers.rows = append(numbers.rows, int64(f.FileID), int64(m.ClassIdx), int64(mi),
+					int64(n.Opcode), n.NumberType, n.LongValue, dbl)
+				if err := l.done(numbers); err != nil {
 					return err
 				}
 			}
